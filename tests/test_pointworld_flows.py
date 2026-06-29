@@ -1,0 +1,48 @@
+from __future__ import annotations
+
+import numpy as np
+
+from mppi.pointworld_ext.flows import (
+    build_robot_inputs,
+    build_scene_features,
+    compute_flow_derivatives,
+    prepare_scene_inputs,
+)
+
+
+def test_compute_flow_derivatives_shapes() -> None:
+    flows = np.arange(2 * 4 * 3 * 3, dtype=np.float32).reshape(2, 4, 3, 3)
+    velocity, acceleration = compute_flow_derivatives(flows)
+    assert velocity.shape == flows.shape
+    assert acceleration.shape == flows.shape
+    assert np.allclose(velocity[:, 0], flows[:, 1] - flows[:, 0])
+
+
+def test_prepare_scene_and_robot_feature_shapes() -> None:
+    scene = prepare_scene_inputs(
+        scene_flows=np.zeros((4, 5, 3), dtype=np.float32),
+        scene_colors=np.zeros((4, 5, 3), dtype=np.uint8),
+        scene_exists=np.ones((4, 5), dtype=bool),
+        scene_track_confidence=None,
+        batch_size=3,
+        max_scene_points=6,
+    )
+    assert scene["scene_flows"].shape == (3, 4, 6, 3)
+    assert scene["scene_exists"].shape == (3, 4, 6)
+
+    robot = build_robot_inputs(
+        robot_flows=np.zeros((3, 4, 2, 3), dtype=np.float32),
+        robot_colors=np.zeros((3, 4, 2, 3), dtype=np.float32),
+        robot_normals=np.zeros((3, 4, 2, 3), dtype=np.float32),
+        gripper_positions=np.zeros((3, 4), dtype=np.float32),
+        max_robot_points=4,
+    )
+    assert robot["robot_features"].shape == (3, 4, 4, 16)
+    assert robot["robot_exists"].shape == (3, 4, 4)
+
+    scene_features = build_scene_features(
+        scene_flows=scene["scene_flows"],
+        scene_colors=scene["scene_colors"],
+        gripper_positions=np.zeros((3, 4), dtype=np.float32),
+    )
+    assert scene_features.shape == (3, 1, 6, 17)

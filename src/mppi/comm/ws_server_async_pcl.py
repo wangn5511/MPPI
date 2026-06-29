@@ -22,6 +22,7 @@ from mppi.curobo_ext.check_depth_pcl import (
 )
 from mppi.curobo_ext.collision_checker import CuRoboCollisionConfig, get_curobo_collision_checker
 from mppi.curobo_ext.scene_builder import SceneBuildConfig, build_scene_points_base_and_colors_from_pcd_back_cam
+from mppi.costs.pointworld_cost import PointWorldCostConfig
 from mppi.protocol.msgpack_codec import decode_message, encode_message
 from mppi.protocol.types_pcl import (
     ActionChunkPCL,
@@ -42,21 +43,10 @@ from mppi.pointworld_ext.input_config import (
 from mppi.pointworld_ext.query_manager import QueryPointManager, QueryPointManagerConfig
 from mppi.pointworld_ext.scene_flow_builder import OnlineSceneFlowBuilder
 from mppi.pointworld_ext.tracker_interface import CoTrackerOnlinePointTracker
+from mppi.pointworld_ext.wrapper import PointWorldCostModel, PointWorldModelConfig
+from mppi.utils.paths import default_urdf_path, repo_path
 from mppi.pointworld_ext.window_buffer import CameraFrame as PWCameraFrame
 from mppi.pointworld_ext.window_buffer import PointWorldWindowBuffer
-
-
-def _pointworld_cost_stub(
-    *,
-    q_traj: np.ndarray,
-    u_traj: np.ndarray,
-    pointworld_obs: Dict[str, Any],
-    gripper: Optional[float],
-) -> np.ndarray:
-    q = np.asarray(q_traj)
-    if q.ndim != 3:
-        raise ValueError(f"Expected q_traj shape (K,T,7), got {q.shape}")
-    return np.zeros((int(q.shape[0]),), dtype=np.float32)
 
 
 def _require_websockets():
@@ -251,7 +241,7 @@ def _cuboid_wire_points(center_xyz: tuple[float, float, float], dims_xyz: tuple[
 def _resolve_save_path(base: str, *, step_id: int) -> str:
     s = str(base).strip()
     if not s:
-        s = "/home/wangyuhan/MPPI/data/test/pcl_scene_filtered.npz"
+        s = repo_path("data", "test", "pcl_scene_filtered.npz")
     if s.lower().endswith(".npz"):
         return s
     out_dir = Path(s)
@@ -378,6 +368,7 @@ class _PointWorldRuntime:
     window: PointWorldWindowBuffer
     builder: OnlineSceneFlowBuilder
     query_manager: QueryPointManager
+    cost_model: Optional[PointWorldCostModel] = None
 
     enabled: bool = True
     last_pointworld_obs: Optional[Dict[str, Any]] = None
@@ -518,7 +509,53 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
     query_manager = QueryPointManager(cfg=QueryPointManagerConfig(max_query_points_per_camera=int(max_q), min_track_confidence=float(min_conf), rng_seed=int(rng_seed)))
     tracker = CoTrackerOnlinePointTracker(checkpoint=str(ckpt), window_len=11, device=device)
     builder = OnlineSceneFlowBuilder(cfg=cfg, window_buffer=window, tracker=tracker, query_manager=query_manager)
-    return _PointWorldRuntime(cfg=cfg, window=window, builder=builder, query_manager=query_manager)
+
+    cost_model: Optional[PointWorldCostModel] = None
+    if _env_bool("MPPI_USE_POINTWORLD_COST", "0"):
+        model_path = os.getenv("MPPI_PW_MODEL_PATH", "").strip()
+        if not model_path:
+            raise ValueError("MPPI_PW_MODEL_PATH is required when MPPI_USE_POINTWORLD_COST=1")
+        urdf_path = os.getenv("MPPI_PW_URDF_PATH", os.getenv("MPPI_URDF_PATH", "")).strip() or default_urdf_path()
+
+        cost_cfg = PointWorldCostConfig(
+            mode=str(os.getenv("MPPI_PW_COST_MODE", "flow_l2")),
+            use_model_confidence=_env_bool("MPPI_PW_USE_MODEL_CONFIDENCE", "1"),
+            use_track_confidence=_env_bool("MPPI_PW_USE_TRACK_CONFIDENCE", "1"),
+            min_confidence=float(os.getenv("MPPI_PW_MIN_COST_CONFIDENCE", "0.0")),
+            ignore_t0=_env_bool("MPPI_PW_COST_IGNORE_T0", "1"),
+        )
+        cost_model = PointWorldCostModel(
+            PointWorldModelConfig(
+                checkpoint_path=str(model_path),
+                device=str(os.getenv("MPPI_PW_MODEL_DEVICE", os.getenv("MPPI_PW_COTRACKER_DEVICE", "cuda"))),
+                domain=(os.getenv("MPPI_PW_MODEL_DOMAIN", "").strip() or None),
+                urdf_path=str(urdf_path),
+                max_scene_points=(
+                    int(os.getenv("MPPI_PW_MAX_SCENE_POINTS"))
+                    if os.getenv("MPPI_PW_MAX_SCENE_POINTS", "").strip()
+                    else None
+                ),
+                max_robot_points=(
+                    int(os.getenv("MPPI_PW_MAX_ROBOT_POINTS"))
+                    if os.getenv("MPPI_PW_MAX_ROBOT_POINTS", "").strip()
+                    else None
+                ),
+                robot_sampler_device=(os.getenv("MPPI_PW_ROBOT_SAMPLER_DEVICE", "").strip() or None),
+                robot_gripper_only=_env_bool("MPPI_PW_ROBOT_GRIPPER_ONLY", "1"),
+                seed=int(os.getenv("MPPI_PW_SEED", "1")),
+                disable_compile=_env_bool("MPPI_PW_DISABLE_COMPILE", "1"),
+                eval_batch_size=int(os.getenv("MPPI_PW_EVAL_BATCH_SIZE", "32")),
+                cost=cost_cfg,
+            )
+        )
+
+    return _PointWorldRuntime(
+        cfg=cfg,
+        window=window,
+        builder=builder,
+        query_manager=query_manager,
+        cost_model=cost_model,
+    )
 
 
 async def _handle_connection(
@@ -614,7 +651,9 @@ async def _handle_connection(
             elif cfg.policy == "mppi_joint":
                 solver = _get_joint_solver(cfg.open_loop_horizon)
                 pw_obs = pw.last_pointworld_obs if (pw is not None and bool(pw.enabled)) else None
-                pw_cost_fn: Optional[PointWorldCostFn] = _pointworld_cost_stub if (pw is not None and bool(pw.enabled)) else None
+                pw_cost_fn: Optional[PointWorldCostFn] = (
+                    pw.cost_model if (pw is not None and bool(pw.enabled) and pw.cost_model is not None) else None
+                )
                 actions = solver.infer_actions(
                     q0=obs.q,
                     gripper=float(obs.gripper),
@@ -689,7 +728,7 @@ async def _handle_connection(
                     scene_cuboids = getattr(solver, "last_scene_cuboids", None)
                     has_table = bool(getattr(solver, "last_scene_has_table", False))
 
-                    out_base = os.getenv("MPPI_PCL_SAVE_PCD_OUT", "/home/wangyuhan/MPPI/data/test/pcl_scene_filtered.npz")
+                    out_base = os.getenv("MPPI_PCL_SAVE_PCD_OUT", repo_path("data", "test", "pcl_scene_filtered.npz"))
                     out_path = _resolve_save_path(out_base, step_id=int(obs.step_id))
                     _save_scene_npz(
                         out_path=str(out_path),

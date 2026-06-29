@@ -5,6 +5,8 @@ import json
 import os
 from typing import Any, Dict, Optional
 
+from mppi.curobo_ext.collision_checker import _load_robot_cfg_dict, _require_curobo_v2, _sanitize_kinematics_cfg
+from mppi.utils.paths import default_urdf_path
 
 def _load_config(path: str) -> Dict[str, Any]:
     if not os.path.isfile(path):
@@ -52,113 +54,26 @@ def _run_curobo_smoke(
     except Exception as e:  # noqa: BLE001
         raise RuntimeError("Missing dependency: torch (required by cuRobo)") from e
 
-    try:
-        from curobo.collision_checking import RobotCollisionChecker, RobotCollisionCheckerCfg
-        from curobo._src.types.device_cfg import DeviceCfg
-        from curobo._src.util_file import get_robot_configs_path, join_path, load_yaml
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError("Missing dependency: curobo (GPU env only)") from e
+    (
+        RobotCollisionChecker,
+        RobotCollisionCheckerCfg,
+        DeviceCfg,
+        get_robot_configs_path,
+        join_path,
+        load_yaml,
+    ) = _require_curobo_v2()
 
     if os.path.isfile(robot_yaml):
         robot_yaml_path = robot_yaml
     else:
         robot_yaml_path = join_path(get_robot_configs_path(), robot_yaml)
 
-    loaded = load_yaml(robot_yaml_path)
-    if not isinstance(loaded, dict):
-        raise ValueError("Invalid robot yaml: expected mapping")
-
-    if "robot_cfg" in loaded:
-        robot_cfg_dict: Dict[str, Any] = loaded
-    else:
-        robot_cfg_dict = {"robot_cfg": loaded}
-
-    kin = robot_cfg_dict.get("robot_cfg", {}).get("kinematics")
-    if not isinstance(kin, dict):
-        raise ValueError("Invalid robot yaml: missing robot_cfg.kinematics")
-
-    kin["urdf_path"] = str(urdf_path)
-
-    link_names: set[str] | None = None
-    joint_names: set[str] | None = None
-    try:
-        import xml.etree.ElementTree as ET
-
-        tree = ET.parse(str(urdf_path))
-        root = tree.getroot()
-        ln: set[str] = set()
-        jn: set[str] = set()
-        for el in root.iter():
-            tag = str(el.tag)
-            if tag.endswith("link"):
-                name = el.attrib.get("name")
-                if name:
-                    ln.add(str(name))
-            elif tag.endswith("joint"):
-                name = el.attrib.get("name")
-                if name:
-                    jn.add(str(name))
-        link_names = ln if len(ln) > 0 else None
-        joint_names = jn if len(jn) > 0 else None
-    except Exception:
-        link_names = None
-        joint_names = None
-
-    requested_tool = str(tool_frame).strip() or "robotiq_85_base_link"
-    if link_names is not None:
-        fallback_order = [
-            requested_tool,
-            "robotiq_85_base_link",
-            "camera_mount_link",
-            "panda_link8",
-            "panda_link7",
-            str(kin.get("base_link", "")).strip(),
-        ]
-        chosen = next((x for x in fallback_order if x and x in link_names), None)
-        if chosen is None:
-            chosen = next(iter(sorted(link_names)))
-        kin["tool_frames"] = [chosen]
-    else:
-        kin["tool_frames"] = [requested_tool]
-
-    if "extra_links" in kin:
-        kin.pop("extra_links", None)
-    if "extra_collision_spheres" in kin:
-        kin.pop("extra_collision_spheres", None)
-
-    if "lock_joints" in kin and joint_names is not None:
-        lock = kin.get("lock_joints")
-        if isinstance(lock, dict):
-            kin["lock_joints"] = {k: v for k, v in lock.items() if str(k) in joint_names}
-
-    if link_names is not None:
-        for k_list in ("collision_link_names", "mesh_link_names", "grasp_contact_link_names"):
-            v = kin.get(k_list)
-            if isinstance(v, list):
-                kin[k_list] = [x for x in v if str(x) in link_names]
-
-        v = kin.get("collision_spheres")
-        if isinstance(v, dict):
-            kin["collision_spheres"] = {k: vv for k, vv in v.items() if str(k) in link_names}
-
-        v = kin.get("self_collision_buffer")
-        if isinstance(v, dict):
-            kin["self_collision_buffer"] = {k: vv for k, vv in v.items() if str(k) in link_names}
-
-        v = kin.get("self_collision_ignore")
-        if isinstance(v, dict):
-            cleaned: Dict[str, Any] = {}
-            for kk, vv in v.items():
-                if str(kk) not in link_names or not isinstance(vv, list):
-                    continue
-                kept = [x for x in vv if str(x) in link_names]
-                if kept:
-                    cleaned[str(kk)] = kept
-            kin["self_collision_ignore"] = cleaned
-
-    tf = kin.get("tool_frames")
-    if not isinstance(tf, list) or len(tf) == 0:
-        kin["tool_frames"] = [str(tool_frame).strip() or "robotiq_85_base_link"]
+    robot_cfg_dict = _load_robot_cfg_dict(str(robot_yaml_path))
+    robot_cfg_dict = _sanitize_kinematics_cfg(
+        robot_cfg_dict=robot_cfg_dict,
+        urdf_path=str(urdf_path),
+        tool_frame=str(tool_frame),
+    )
 
     device_cfg = DeviceCfg(device=torch.device(device), dtype=torch.float32)
 
@@ -315,7 +230,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.cmd == "curobo-smoke":
         urdf_default = os.getenv(
             "MPPI_URDF_PATH",
-            "/home/wangyuhan/PointWorld/assets/franka_description/franka_panda_robotiq_2f85.urdf",
+            default_urdf_path(),
         )
         urdf_path = str(args.urdf) if args.urdf is not None else str(urdf_default)
         tool_frame = (

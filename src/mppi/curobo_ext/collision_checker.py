@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
+from mppi.utils.paths import default_urdf_path, ensure_sys_path_for_runtime
 
 def _require_torch():
     try:
@@ -87,6 +88,7 @@ def _fk_T_base_link(urdf_path: str, q7: np.ndarray, link_name: str) -> np.ndarra
 
 
 def _require_curobo_v2():
+    ensure_sys_path_for_runtime()
     try:
         from curobo.collision_checking import RobotCollisionChecker, RobotCollisionCheckerCfg
         from curobo._src.types.device_cfg import DeviceCfg
@@ -168,6 +170,17 @@ def _sanitize_kinematics_cfg(
     kin.pop("extra_collision_spheres", None)
 
     if joints is not None:
+        cspace = kin.get("cspace")
+        if isinstance(cspace, dict):
+            names = cspace.get("joint_names")
+            if isinstance(names, list):
+                keep_idx = [i for i, name in enumerate(names) if str(name) in joints]
+                cspace["joint_names"] = [names[i] for i in keep_idx]
+                for list_key in ("default_joint_position", "retract_config", "null_space_weight", "cspace_distance_weight"):
+                    values = cspace.get(list_key)
+                    if isinstance(values, list) and len(values) == len(names):
+                        cspace[list_key] = [values[i] for i in keep_idx]
+
         lock = kin.get("lock_joints")
         if isinstance(lock, dict):
             kin["lock_joints"] = {k: v for k, v in lock.items() if str(k) in joints}
@@ -208,7 +221,7 @@ def _sanitize_kinematics_cfg(
 class CuRoboCollisionConfig:
     device: str = "cuda:0"
     robot_yaml: str = "franka.yml"
-    urdf_path: str = "/home/wangyuhan/PointWorld/assets/franka_description/franka_panda_robotiq_2f85.urdf"
+    urdf_path: str = default_urdf_path()
     tool_frame: str = "robotiq_85_base_link"
 
     with_world: bool = True
