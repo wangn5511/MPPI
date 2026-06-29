@@ -6,6 +6,8 @@ from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 
+from mppi.utils.paths import ensure_sys_path_for_runtime
+
 
 POINTWORLD_WINDOW_LEN = 11
 
@@ -33,6 +35,26 @@ def _require_torch():
         raise RuntimeError("Missing dependency: torch") from e
 
     return torch
+
+
+def _infer_cotracker_window_len(checkpoint: str) -> int | None:
+    torch = _require_torch()
+    with open(str(checkpoint), "rb") as f:
+        state_dict = torch.load(f, map_location="cpu")
+    if isinstance(state_dict, dict) and "model" in state_dict:
+        state_dict = state_dict["model"]
+    if not isinstance(state_dict, dict):
+        return None
+    time_emb = state_dict.get("time_emb")
+    if time_emb is None:
+        return None
+    try:
+        shape = tuple(int(x) for x in time_emb.shape)
+    except Exception:
+        return None
+    if len(shape) >= 2 and int(shape[1]) > 0:
+        return int(shape[1])
+    return None
 
 
 def _as_frames_array(frames: Union[np.ndarray, Sequence[np.ndarray]]) -> np.ndarray:
@@ -71,6 +93,7 @@ class CoTrackerOnlinePointTracker(OnlinePointTracker):
                 device = "cpu"
 
         ckpt = str(checkpoint)
+        ensure_sys_path_for_runtime()
         try:
             from cotracker.predictor import CoTrackerOnlinePredictor
         except Exception as e:  # noqa: BLE001
@@ -78,11 +101,13 @@ class CoTrackerOnlinePointTracker(OnlinePointTracker):
                 "Failed to import cotracker. Install MPPI third_party/co-tracker with: pip install -e /home/wangyuhan/MPPI/third_party/co-tracker"
             ) from e
 
-        predictor = CoTrackerOnlinePredictor(checkpoint=ckpt, window_len=int(window_len), v2=bool(v2))
+        model_window_len = _infer_cotracker_window_len(ckpt) or int(window_len)
+        predictor = CoTrackerOnlinePredictor(checkpoint=ckpt, window_len=int(model_window_len), v2=bool(v2))
 
         self._torch = torch
         self._predictor = predictor.to(device)
         self._device = str(device)
+        self._model_window_len = int(model_window_len)
 
     def track_window(self, frames: Union[np.ndarray, Sequence[np.ndarray]], query_points: np.ndarray) -> TrackWindowOutput:
         torch = self._torch

@@ -15,6 +15,7 @@ from mppi.protocol.types import (
     SCHEMA_VERSION_V1,
     ServerTimingV1,
 )
+from mppi.utils.paths import default_urdf_path, repo_path
 
 _JOINT_SOLVER: JointMPPISolver | None = None
 
@@ -93,7 +94,7 @@ def _get_joint_solver(horizon: int) -> JointMPPISolver:
 
     urdf_path = os.getenv(
         "MPPI_URDF_PATH",
-        "/home/wangyuhan/PointWorld/assets/franka_description/franka_panda_robotiq_2f85.urdf",
+        default_urdf_path(),
     )
     ee_link = os.getenv("MPPI_EE_LINK", "robotiq_85_base_link")
     link7_link = os.getenv("MPPI_LINK7_LINK", "panda_link7")
@@ -122,7 +123,7 @@ def _get_joint_solver(horizon: int) -> JointMPPISolver:
     scene_wall_center = _env_vec3("MPPI_SCENE_WALL_CENTER", "0.5,0.5,-0.5")
     scene_wall_margin_m = _env_f("MPPI_SCENE_WALL_MARGIN_M", "0.05")
 
-    t_base_cam_back_path = os.getenv("MPPI_T_BASE_CAM_BACK_PATH", "/home/wangyuhan/MPPI/configs/T_base_cam.yaml")
+    t_base_cam_back_path = os.getenv("MPPI_T_BASE_CAM_BACK_PATH", repo_path("configs", "T_base_cam.yaml"))
     scene_roi_min = _env_vec3("MPPI_SCENE_ROI_MIN", "-0.1,-0.7,-0.05")
     scene_roi_max = _env_vec3("MPPI_SCENE_ROI_MAX", "1.2,0.7,1.2")
     scene_voxel_size_m = _env_f("MPPI_SCENE_VOXEL_SIZE_M", "0.01")
@@ -139,6 +140,7 @@ def _get_joint_solver(horizon: int) -> JointMPPISolver:
 
     infer_budget_ms = _env_f("MPPI_INFER_BUDGET_MS", "0")
     budget_max_dynamic_cuboids = _env_i("MPPI_BUDGET_MAX_DYNAMIC_CUBOIDS", "0")
+    num_samples = _env_i("MPPI_NUM_SAMPLES", "256")
 
     debug_cost_stats = _env_bool("MPPI_DEBUG_COST_STATS", "0")
     debug_cost_stats_q = _env_f("MPPI_DEBUG_COST_STATS_Q", "0.5")
@@ -149,6 +151,7 @@ def _get_joint_solver(horizon: int) -> JointMPPISolver:
     if _JOINT_SOLVER is None or _JOINT_SOLVER.cfg.horizon != int(horizon):
         cfg = JointMPPIConfig(
             horizon=int(horizon),
+            num_samples=int(num_samples),
             w_ee_pos=w_ee_pos,
             ee_pos_goal=ee_goal,
             w_link7_pos=w_link7_pos,

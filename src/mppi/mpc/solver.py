@@ -9,6 +9,7 @@ from mppi.costs.ee_pose import ee_pos_cost
 from mppi.curobo_ext.collision_checker import CuRoboCollisionConfig, get_curobo_collision_checker
 from mppi.curobo_ext.scene_builder import SceneBuildConfig, build_scene_cuboids_from_pcd_back_cam
 from mppi.robots.franka_kinematics import FrankaFK
+from mppi.utils.paths import default_urdf_path, repo_path
 
 
 class PointWorldCostFn(Protocol):
@@ -249,7 +250,7 @@ class JointMPPIConfig:
     scene_wall_center: tuple[float, float, float] = (0.0, 0.0, 0.0)
     scene_wall_margin_m: float = 0.02
 
-    t_base_cam_back_path: str = "/home/wangyuhan/MPPI/configs/T_base_cam.yaml"
+    t_base_cam_back_path: str = repo_path("configs", "T_base_cam.yaml")
     scene_roi_min: tuple[float, float, float] = (-0.1, -0.7, -0.05)
     scene_roi_max: tuple[float, float, float] = (1.2, 0.7, 1.2)
     scene_voxel_size_m: float = 0.01
@@ -276,7 +277,7 @@ class JointMPPIConfig:
     pointworld_require_horizon_11: bool = True
     pointworld_cost_timeout_ms: float = 0.0
 
-    urdf_path: str = "/home/wangyuhan/PointWorld/assets/franka_description/franka_panda_robotiq_2f85.urdf"
+    urdf_path: str = default_urdf_path()
     ee_link: str = "robotiq_85_base_link"
     link7_link: str = "panda_link7"
 
