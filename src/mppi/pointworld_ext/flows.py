@@ -307,3 +307,29 @@ def build_scene_features(
     dist2robot = np.zeros((B, 1, Ns, T), dtype=np.float32)
 
     return np.concatenate([flow0, color0, normals0, gripper_ctx, dist2robot], axis=-1).astype(np.float32)
+
+
+def build_scene_features_torch(*, scene_flows, scene_colors, gripper_positions):
+    try:
+        import torch
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("Missing dependency: torch") from e
+
+    flows = torch.as_tensor(scene_flows, dtype=torch.float32)
+    colors = torch.as_tensor(scene_colors, device=flows.device, dtype=torch.float32)
+    gripper = torch.as_tensor(gripper_positions, device=flows.device, dtype=torch.float32)
+
+    if flows.ndim != 4 or int(flows.shape[-1]) != 3:
+        raise ValueError(f"scene_flows must be (B,T,N,3), got {tuple(flows.shape)}")
+    if tuple(colors.shape) != tuple(flows.shape):
+        raise ValueError(f"scene_colors must match scene_flows shape, got {tuple(colors.shape)} vs {tuple(flows.shape)}")
+    if tuple(gripper.shape) != tuple(flows.shape[:2]):
+        raise ValueError(f"gripper_positions shape {tuple(gripper.shape)} must match scene_flows[:2]={tuple(flows.shape[:2])}")
+
+    B, T, Ns, _ = flows.shape
+    normals0 = torch.zeros((B, 1, Ns, 3), device=flows.device, dtype=torch.float32)
+    flow0 = flows[:, :1]
+    color0 = colors[:, :1]
+    gripper_ctx = gripper[:, None, None, :].expand(B, 1, Ns, T)
+    dist2robot = torch.zeros((B, 1, Ns, T), device=flows.device, dtype=torch.float32)
+    return torch.cat([flow0, color0, normals0, gripper_ctx, dist2robot], dim=-1).to(dtype=torch.float32)
