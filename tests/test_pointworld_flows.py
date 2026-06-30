@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import numpy as np
 
+try:
+    import torch
+except Exception:  # noqa: BLE001
+    torch = None
+
 from mppi.pointworld_ext.flows import (
     build_robot_inputs,
     build_scene_features,
+    build_scene_features_torch,
     compute_flow_derivatives,
     prepare_scene_inputs,
 )
@@ -46,3 +52,25 @@ def test_prepare_scene_and_robot_feature_shapes() -> None:
         gripper_positions=np.zeros((3, 4), dtype=np.float32),
     )
     assert scene_features.shape == (3, 1, 6, 17)
+
+
+def test_build_scene_features_torch_matches_numpy() -> None:
+    if torch is None:
+        return
+
+    rng = np.random.default_rng(5)
+    scene_flows = rng.normal(size=(3, 4, 6, 3)).astype(np.float32)
+    scene_colors = rng.normal(size=(3, 4, 6, 3)).astype(np.float32)
+    gripper_positions = rng.normal(size=(3, 4)).astype(np.float32)
+
+    expected = build_scene_features(
+        scene_flows=scene_flows,
+        scene_colors=scene_colors,
+        gripper_positions=gripper_positions,
+    )
+    actual = build_scene_features_torch(
+        scene_flows=torch.as_tensor(scene_flows),
+        scene_colors=torch.as_tensor(scene_colors),
+        gripper_positions=torch.as_tensor(gripper_positions),
+    )
+    assert np.allclose(actual.cpu().numpy(), expected, atol=1e-6)

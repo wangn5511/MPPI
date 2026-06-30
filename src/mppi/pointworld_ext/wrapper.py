@@ -17,7 +17,7 @@ from mppi.costs.pointworld_cost import (
 from mppi.pointworld_ext.flows import (
     RobotFlowAdapter,
     build_robot_inputs,
-    build_scene_features,
+    build_scene_features_torch,
     prepare_scene_inputs,
 )
 from mppi.utils.paths import default_pointworld_root, default_urdf_path, ensure_sys_path_for_runtime
@@ -311,7 +311,7 @@ class PointWorldCostModel:
         pointworld_obs: dict[str, Any],
         gripper: Optional[float],
         robot: RobotFlowAdapter,
-    ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         q = np.asarray(q_traj, dtype=np.float32)
         if q.ndim != 3 or q.shape[-1] != 7:
             raise ValueError(f"q_traj must be (B,T,7), got {q.shape}")
@@ -322,7 +322,7 @@ class PointWorldCostModel:
             scene_colors=np.asarray(pointworld_obs.get("scene_colors"), dtype=np.uint8),
             scene_exists=np.asarray(pointworld_obs["scene_exists"], dtype=bool),
             scene_track_confidence=pointworld_obs.get("scene_track_confidence"),
-            batch_size=int(B),
+            batch_size=1,
             max_scene_points=int(self.max_scene_points),
         )
         if int(scene["scene_flows"].shape[1]) != int(T):
@@ -349,23 +349,13 @@ class PointWorldCostModel:
             gripper_positions=gripper_arr,
             max_robot_points=int(self.max_robot_points),
         )
-        scene_features = build_scene_features(
-            scene_flows=scene["scene_flows"],
-            scene_colors=scene["scene_colors"],
-            gripper_positions=gripper_arr,
-        )
-
         batch = {
-            "scene_flows": scene["scene_flows"],
-            "scene_exists": scene["scene_exists"],
-            "scene_features": scene_features,
+            "gripper_positions": gripper_arr,
             "robot_flows": robot["robot_flows"],
             "robot_features": robot["robot_features"],
             "robot_exists": robot["robot_exists"],
-            "scene_track_confidence": scene["scene_track_confidence"],
-            "__domain__": [self._domain] * B,
         }
-        return batch, scene["scene_track_confidence"]
+        return scene, batch
 
     def _numpy_batch_to_torch(self, batch: dict[str, Any], *, device: str) -> dict[str, Any]:
         torch = self._torch
@@ -396,10 +386,10 @@ class PointWorldCostModel:
         self,
         *,
         replica: _PointWorldReplica,
+        scene_np: dict[str, np.ndarray],
         batch_np: dict[str, np.ndarray],
-        track_conf: Optional[np.ndarray],
     ) -> np.ndarray:
-        B = int(batch_np["scene_flows"].shape[0])
+        B = int(batch_np["robot_flows"].shape[0])
         chunk_size = max(1, min(int(self.cfg.eval_batch_size), B))
         costs: list[np.ndarray] = []
         torch = self._torch
@@ -407,10 +397,31 @@ class PointWorldCostModel:
         if replica.device.startswith("cuda"):
             torch.cuda.set_device(torch.device(replica.device))
 
+        scene_t = self._numpy_batch_to_torch(scene_np, device=replica.device)
+
         for start in range(0, B, chunk_size):
             end = min(B, start + chunk_size)
             batch_chunk = self._slice_batch(batch_np, start, end)
-            batch_t = self._numpy_batch_to_torch(batch_chunk, device=replica.device)
+            robot_t = self._numpy_batch_to_torch(batch_chunk, device=replica.device)
+            chunk_b = int(end - start)
+
+            scene_flows_t = scene_t["scene_flows"].expand(chunk_b, -1, -1, -1)
+            scene_colors_t = scene_t["scene_colors"].expand(chunk_b, -1, -1, -1)
+            scene_exists_t = scene_t["scene_exists"].expand(chunk_b, -1, -1)
+            scene_features_t = build_scene_features_torch(
+                scene_flows=scene_flows_t,
+                scene_colors=scene_colors_t,
+                gripper_positions=robot_t["gripper_positions"],
+            )
+            batch_t = {
+                "scene_flows": scene_flows_t,
+                "scene_exists": scene_exists_t,
+                "scene_features": scene_features_t,
+                "robot_flows": robot_t["robot_flows"],
+                "robot_features": robot_t["robot_features"],
+                "robot_exists": robot_t["robot_exists"],
+                "__domain__": [self._domain] * chunk_b,
+            }
 
             with torch.no_grad():
                 encoded_scene = self._encode_scene_raw_only(
@@ -422,8 +433,8 @@ class PointWorldCostModel:
 
             model_conf = outputs.get("confidence")
             track_conf_t = None
-            if track_conf is not None:
-                track_conf_t = torch.as_tensor(track_conf[start:end], device=torch.device(replica.device), dtype=torch.float32)
+            if "scene_track_confidence" in scene_t:
+                track_conf_t = scene_t["scene_track_confidence"].expand(chunk_b, -1, -1)
 
             costs.append(
                 reduce_pointworld_cost_torch(
@@ -445,13 +456,13 @@ class PointWorldCostModel:
         pointworld_obs: dict[str, Any],
         gripper: Optional[float],
     ) -> np.ndarray:
-        batch_np, track_conf = self._prepare_batch(
+        scene_np, batch_np = self._prepare_batch(
             q_traj=q_traj,
             pointworld_obs=pointworld_obs,
             gripper=gripper,
             robot=replica.robot,
         )
-        return self._evaluate_batch_on_replica(replica=replica, batch_np=batch_np, track_conf=track_conf)
+        return self._evaluate_batch_on_replica(replica=replica, scene_np=scene_np, batch_np=batch_np)
 
     def _make_ranges(self, total: int, parts: int) -> list[tuple[int, int]]:
         if total <= 0 or parts <= 0:
