@@ -10,7 +10,10 @@ from typing import Any, Optional
 import numpy as np
 import torch.nn as nn
 
-from mppi.costs.pointworld_cost import PointWorldCostConfig, reduce_pointworld_cost
+from mppi.costs.pointworld_cost import (
+    PointWorldCostConfig,
+    reduce_pointworld_cost_torch,
+)
 from mppi.pointworld_ext.flows import (
     RobotFlowAdapter,
     build_robot_inputs,
@@ -417,21 +420,19 @@ class PointWorldCostModel:
                 )
                 outputs = replica.model(batch_t, training=False, encoded_scene_feat0=encoded_scene)
 
-            scene_relative = outputs["scene_relative"].detach().cpu().numpy().astype(np.float32)
-            scene_exists = batch_chunk["scene_exists"]
             model_conf = outputs.get("confidence")
-            model_conf_np = None
-            if model_conf is not None:
-                model_conf_np = model_conf.detach().cpu().numpy().astype(np.float32)
+            track_conf_t = None
+            if track_conf is not None:
+                track_conf_t = torch.as_tensor(track_conf[start:end], device=torch.device(replica.device), dtype=torch.float32)
 
             costs.append(
-                reduce_pointworld_cost(
-                    scene_relative=scene_relative,
-                    scene_exists=scene_exists,
-                    model_confidence=model_conf_np,
-                    track_confidence=(track_conf[start:end] if track_conf is not None else None),
+                reduce_pointworld_cost_torch(
+                    scene_relative=outputs["scene_relative"],
+                    scene_exists=batch_t["scene_exists"],
+                    model_confidence=model_conf,
+                    track_confidence=track_conf_t,
                     cfg=self.cfg.cost,
-                )
+                ).detach().cpu().numpy().astype(np.float32)
             )
 
         return np.concatenate(costs, axis=0).astype(np.float32, copy=False)

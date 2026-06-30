@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
-from mppi.costs.pointworld_cost import PointWorldCostConfig, reduce_pointworld_cost
+torch = pytest.importorskip("torch")
+
+from mppi.costs.pointworld_cost import (
+    PointWorldCostConfig,
+    reduce_pointworld_cost,
+    reduce_pointworld_cost_torch,
+)
 
 
 def test_reduce_pointworld_cost_ignores_t0_and_weights_confidence() -> None:
@@ -39,3 +46,37 @@ def test_reduce_pointworld_cost_final_mode() -> None:
     )
 
     assert np.allclose(out, np.asarray([9.0, 16.0], dtype=np.float32))
+
+
+def test_reduce_pointworld_cost_torch_matches_numpy() -> None:
+    rng = np.random.default_rng(7)
+    rel = rng.normal(size=(3, 5, 7, 3)).astype(np.float32)
+    exists = rng.random((3, 5, 7)) > 0.2
+    model_conf = rng.random((3, 5, 7)).astype(np.float32)
+    track_conf = rng.random((3, 5, 7)).astype(np.float32)
+    cfg = PointWorldCostConfig(
+        mode="flow_l2",
+        use_model_confidence=True,
+        use_track_confidence=True,
+        min_confidence=0.15,
+        ignore_t0=True,
+    )
+
+    expected = reduce_pointworld_cost(
+        scene_relative=rel,
+        scene_exists=exists,
+        model_confidence=model_conf,
+        track_confidence=track_conf,
+        cfg=cfg,
+    )
+
+    out = reduce_pointworld_cost_torch(
+        scene_relative=torch.as_tensor(rel),
+        scene_exists=torch.as_tensor(exists),
+        model_confidence=torch.as_tensor(model_conf),
+        track_confidence=torch.as_tensor(track_conf),
+        cfg=cfg,
+    )
+
+    assert out.device.type == "cpu"
+    assert np.allclose(out.numpy(), expected, atol=1e-6)
