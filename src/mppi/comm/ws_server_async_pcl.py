@@ -6,7 +6,7 @@ import io
 import os
 import time
 import zlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -42,6 +42,7 @@ from mppi.pointworld_ext.input_config import (
 )
 from mppi.pointworld_ext.query_manager import QueryPointManager, QueryPointManagerConfig
 from mppi.pointworld_ext.scene_flow_builder import OnlineSceneFlowBuilder
+from mppi.pointworld_ext.pointworld_batch_adapter import build_pointworld_batch
 from mppi.pointworld_ext.tracker_interface import CoTrackerOnlinePointTracker
 from mppi.pointworld_ext.wrapper import PointWorldCostModel, PointWorldModelConfig
 from mppi.utils.paths import default_urdf_path, repo_path
@@ -140,6 +141,61 @@ def _decode_depth(*, codec: Optional[str], data: Any) -> np.ndarray:
         return np.asarray(d, dtype=np.float32)
 
     raise ValueError(f"Unsupported depth_codec: {c}")
+
+
+def _require_cv2():
+    try:
+        import cv2  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("Missing dependency: cv2 (opencv-python) is required for contract resize") from e
+    return cv2
+
+
+def _resize_rgbd_to_contract(
+    *,
+    rgb: np.ndarray,
+    depth: np.ndarray,
+    intr: Any,
+    target_hw: Tuple[int, int] = (180, 320),
+) -> Tuple[np.ndarray, np.ndarray, Any]:
+    d = np.asarray(depth)
+    if d.ndim == 3 and d.shape[-1] == 1:
+        d = d[..., 0]
+    if d.ndim != 2:
+        raise ValueError(f"Expected depth shape (H,W), got {d.shape}")
+
+    rgb_arr = np.asarray(rgb)
+    if rgb_arr.ndim != 3 or rgb_arr.shape[-1] != 3:
+        raise ValueError(f"Expected rgb shape (H,W,3), got {rgb_arr.shape}")
+
+    src_h, src_w = int(d.shape[0]), int(d.shape[1])
+    dst_h, dst_w = int(target_hw[0]), int(target_hw[1])
+
+    if (src_h, src_w) == (dst_h, dst_w):
+        return rgb_arr, np.asarray(d, dtype=np.float32), intr
+
+    cv2 = _require_cv2()
+
+    rgb_u8 = rgb_arr
+    if rgb_u8.dtype != np.uint8:
+        rgb_u8 = np.clip(rgb_u8, 0, 255).astype(np.uint8)
+
+    depth_f32 = np.asarray(d, dtype=np.float32)
+
+    rgb_rs = cv2.resize(rgb_u8, (int(dst_w), int(dst_h)), interpolation=cv2.INTER_AREA)
+    depth_rs = cv2.resize(depth_f32, (int(dst_w), int(dst_h)), interpolation=cv2.INTER_NEAREST)
+
+    sx = float(dst_w) / float(src_w)
+    sy = float(dst_h) / float(src_h)
+
+    intr_out = type(intr)(
+        fx=float(getattr(intr, "fx")) * sx,
+        fy=float(getattr(intr, "fy")) * sy,
+        cx=float(getattr(intr, "cx")) * sx,
+        cy=float(getattr(intr, "cy")) * sy,
+    )
+
+    return np.asarray(rgb_rs), np.asarray(depth_rs, dtype=np.float32), intr_out
 
 
 def _sphere_surface_points(center: np.ndarray, radius: float, n: int) -> np.ndarray:
@@ -372,8 +428,8 @@ class _PointWorldRuntime:
 
     enabled: bool = True
     last_pointworld_obs: Optional[Dict[str, Any]] = None
-    last_cam_id: str = ""
-    last_hw: Tuple[int, int] = (0, 0)
+    last_camera_names: Tuple[str, ...] = ()
+    last_hw_by_camera: Dict[str, Tuple[int, int]] = field(default_factory=dict)
     last_step_id: int = -1
     last_ts_s: float = float("nan")
 
@@ -381,44 +437,39 @@ class _PointWorldRuntime:
         self.window.reset()
         self.query_manager.reset()
         self.last_pointworld_obs = None
+        self.last_camera_names = ()
+        self.last_hw_by_camera.clear()
+        self.last_step_id = -1
+        self.last_ts_s = float("nan")
 
     def push_and_maybe_build(
         self,
         *,
-        cam_id: str,
+        cameras: Dict[str, PWCameraFrame],
         step_id: int,
         ts_s: float,
-        rgb: np.ndarray,
-        depth: np.ndarray,
-        intr: Any,
-        T_base_cam: np.ndarray,
         q: np.ndarray,
         gripper: float,
     ) -> Optional[Dict[str, Any]]:
-        cid = str(cam_id)
-        H, W = int(depth.shape[0]), int(depth.shape[1])
+        if not cameras:
+            raise ValueError("cameras must be non-empty")
 
-        if self.last_cam_id and cid != self.last_cam_id:
+        names = tuple(sorted(str(k) for k in cameras.keys()))
+        hw_by_cam = {n: (int(cameras[n].depth.shape[0]), int(cameras[n].depth.shape[1])) for n in names}
+
+        if self.last_camera_names and names != self.last_camera_names:
             self.reset()
-        if self.last_hw != (0, 0) and (H, W) != self.last_hw:
+        if self.last_hw_by_camera and hw_by_cam != self.last_hw_by_camera:
             self.reset()
         if self.last_step_id >= 0 and int(step_id) <= int(self.last_step_id):
             self.reset()
         if np.isfinite(self.last_ts_s) and float(ts_s) <= float(self.last_ts_s):
             self.reset()
 
-        self.last_cam_id = cid
-        self.last_hw = (H, W)
+        self.last_camera_names = names
+        self.last_hw_by_camera = hw_by_cam
         self.last_step_id = int(step_id)
         self.last_ts_s = float(ts_s)
-
-        intr_pw = PWPinholeIntrinsics(fx=float(intr.fx), fy=float(intr.fy), cx=float(intr.cx), cy=float(intr.cy))
-        frame = PWCameraFrame(
-            rgb=np.asarray(rgb),
-            depth=np.asarray(depth),
-            intrinsics=intr_pw,
-            extrinsics=np.asarray(T_base_cam, dtype=np.float32).reshape(4, 4),
-        )
 
         q7 = np.asarray(q, dtype=np.float32).reshape(-1)
         if q7.shape[0] < 7:
@@ -426,7 +477,7 @@ class _PointWorldRuntime:
         q7 = q7[:7]
 
         self.window.push_frame(
-            cameras={cid: frame},
+            cameras={str(k): v for k, v in dict(cameras).items()},
             joint_positions=q7,
             gripper_positions=np.asarray([float(gripper)], dtype=np.float32),
             timestamp=float(ts_s),
@@ -441,18 +492,18 @@ class _PointWorldRuntime:
         q_win = np.stack([np.asarray(s.joint_positions, dtype=np.float32).reshape(-1)[:7] for s in steps], axis=0)
         g_win = np.asarray([float(np.asarray(s.gripper_positions).reshape(-1)[0]) for s in steps], dtype=np.float32)
 
-        obs: Dict[str, Any] = {
-            "scene_flows": np.asarray(scene.scene_flows, dtype=np.float32),
-            "scene_exists": np.asarray(scene.scene_exists, dtype=bool),
-            "scene_track_confidence": np.asarray(scene.scene_track_confidence, dtype=np.float32),
-            "scene_colors": np.asarray(scene.scene_colors, dtype=np.uint8),
-            "cameras_used": np.asarray(list(scene.cameras_used)),
-            "camera_track_slices": np.asarray(scene.camera_track_slices, dtype=np.int32),
-            "camera_track_ids": np.asarray(scene.camera_track_ids, dtype=np.int32),
-            "timestamps": ts,
-            "joint_positions_window": q_win,
-            "gripper_positions_window": g_win,
-        }
+        batch = build_pointworld_batch(
+            scene=scene,
+            robot_flows=None,
+            robot_positions=q_win,
+            gripper_positions=g_win,
+        )
+
+        obs: Dict[str, Any] = dict(batch)
+        obs["timestamps"] = ts
+        obs["joint_positions_window"] = q_win
+        obs["gripper_positions_window"] = g_win
+
         self.last_pointworld_obs = obs
         return obs
 
@@ -471,8 +522,8 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
     min_conf = float(_env_f("MPPI_PW_MIN_TRACK_CONFIDENCE", "0.0"))
     rng_seed = _env_i("MPPI_PW_QUERY_RNG_SEED", "0")
 
-    ws_min = _env_vec3("MPPI_PW_WORKSPACE_MIN", "-0.1,-0.7,-0.05")
-    ws_max = _env_vec3("MPPI_PW_WORKSPACE_MAX", "1.2,0.7,1.2")
+    ws_min = _env_vec3("MPPI_PW_WORKSPACE_MIN", "0.00,-0.38,-0.30")
+    ws_max = _env_vec3("MPPI_PW_WORKSPACE_MAX", "0.80,0.30,1.20")
 
     seed_robot_mask_enabled = _env_bool("MPPI_PW_SEED_ROBOT_MASK_ENABLED", "0")
     robot_mask_seed = int(os.getenv("MPPI_PW_ROBOT_MASK_SEED", "0"))
@@ -588,43 +639,121 @@ async def _handle_connection(
             request_id = str(envelope["request_id"])
             obs = ObsPCL.from_payload(dict(envelope["payload"]))
 
-            intr, T_base_cam = parse_obs_camera_params(
-                cam_id=obs.cam_id,
-                intrinsics=obs.intrinsics,
-                T_base_cam=obs.T_base_cam,
-                cam_configs=cam_configs,
-            )
-
-            depth_unit_scale = float(obs.depth_unit_scale) if obs.depth_unit_scale is not None else _env_f("MPPI_PCL_DEPTH_UNIT_SCALE", "1.0")
             depth_min_m = _env_f("MPPI_PCL_DEPTH_MIN_M", "0.05")
             depth_max_m = _env_f("MPPI_PCL_DEPTH_MAX_M", "2.0")
             stride = _env_i("MPPI_PCL_STRIDE", "1")
 
-            if obs.rgb_bytes is not None:
-                rgb = _decode_rgb(codec=obs.rgb_codec, data=obs.rgb_bytes)
-            elif obs.rgb_back is not None:
-                rgb = np.asarray(obs.rgb_back)
-            else:
-                raise ValueError("Missing rgb payload: provide rgb_bytes or rgb_back")
+            primary_cam_id = str(obs.cam_id) if obs.cam_id is not None else str(cfg.cam_id)
 
-            if obs.depth_bytes is not None:
-                depth = _decode_depth(codec=obs.depth_codec, data=obs.depth_bytes)
-            elif obs.depth_back is not None:
-                depth = np.asarray(obs.depth_back)
+            pw_cameras: Dict[str, PWCameraFrame] = {}
+            rgb_primary = None
+            depth_primary = None
+            intr_primary = None
+            T_primary = None
+            depth_unit_scale_primary = float(obs.depth_unit_scale) if obs.depth_unit_scale is not None else _env_f("MPPI_PCL_DEPTH_UNIT_SCALE", "1.0")
+
+            cams_payload = getattr(obs, "cameras", None)
+            if isinstance(cams_payload, dict) and cams_payload:
+                if primary_cam_id not in cams_payload:
+                    primary_cam_id = sorted(str(k) for k in cams_payload.keys())[0]
+
+                for cam_name_raw, cam_pl in cams_payload.items():
+                    cam_name = str(cam_name_raw)
+                    if not isinstance(cam_pl, dict):
+                        raise ValueError(f"cameras[{cam_name}] must be a dict")
+
+                    intr_i, T_i = parse_obs_camera_params(
+                        cam_id=cam_name,
+                        intrinsics=(dict(cam_pl["intrinsics"]) if "intrinsics" in cam_pl and cam_pl["intrinsics"] is not None else None),
+                        T_base_cam=(cam_pl.get("T_base_cam", None)),
+                        cam_configs=cam_configs,
+                    )
+
+                    if cam_pl.get("rgb_bytes", None) is not None:
+                        rgb_i = _decode_rgb(codec=(cam_pl.get("rgb_codec", None)), data=cam_pl.get("rgb_bytes", None))
+                    elif cam_pl.get("rgb_back", None) is not None:
+                        rgb_i = np.asarray(cam_pl.get("rgb_back", None))
+                    else:
+                        raise ValueError(f"Missing rgb for camera {cam_name}")
+
+                    if cam_pl.get("depth_bytes", None) is not None:
+                        depth_i = _decode_depth(codec=(cam_pl.get("depth_codec", None)), data=cam_pl.get("depth_bytes", None))
+                    elif cam_pl.get("depth_back", None) is not None:
+                        depth_i = np.asarray(cam_pl.get("depth_back", None))
+                    else:
+                        raise ValueError(f"Missing depth for camera {cam_name}")
+
+                    rgb_i, depth_i, intr_i = _resize_rgbd_to_contract(rgb=np.asarray(rgb_i), depth=np.asarray(depth_i), intr=intr_i)
+
+                    intr_pw = PWPinholeIntrinsics(fx=float(intr_i.fx), fy=float(intr_i.fy), cx=float(intr_i.cx), cy=float(intr_i.cy))
+                    pw_cameras[cam_name] = PWCameraFrame(
+                        rgb=np.asarray(rgb_i),
+                        depth=np.asarray(depth_i),
+                        intrinsics=intr_pw,
+                        extrinsics=np.asarray(T_i, dtype=np.float32).reshape(4, 4),
+                    )
+
+                    if cam_name == primary_cam_id:
+                        rgb_primary = np.asarray(rgb_i)
+                        depth_primary = np.asarray(depth_i)
+                        intr_primary = intr_i
+                        T_primary = T_i
+                        depth_unit_scale_primary = (
+                            float(cam_pl["depth_unit_scale"])
+                            if "depth_unit_scale" in cam_pl and cam_pl["depth_unit_scale"] is not None
+                            else depth_unit_scale_primary
+                        )
             else:
-                raise ValueError("Missing depth payload: provide depth_bytes or depth_back")
+                intr_primary, T_primary = parse_obs_camera_params(
+                    cam_id=primary_cam_id,
+                    intrinsics=obs.intrinsics,
+                    T_base_cam=obs.T_base_cam,
+                    cam_configs=cam_configs,
+                )
+
+                if obs.rgb_bytes is not None:
+                    rgb_primary = _decode_rgb(codec=obs.rgb_codec, data=obs.rgb_bytes)
+                elif obs.rgb_back is not None:
+                    rgb_primary = np.asarray(obs.rgb_back)
+                else:
+                    raise ValueError("Missing rgb payload: provide rgb_bytes or rgb_back")
+
+                if obs.depth_bytes is not None:
+                    depth_primary = _decode_depth(codec=obs.depth_codec, data=obs.depth_bytes)
+                elif obs.depth_back is not None:
+                    depth_primary = np.asarray(obs.depth_back)
+                else:
+                    raise ValueError("Missing depth payload: provide depth_bytes or depth_back")
+
+                rgb_primary, depth_primary, intr_primary = _resize_rgbd_to_contract(
+                    rgb=np.asarray(rgb_primary),
+                    depth=np.asarray(depth_primary),
+                    intr=intr_primary,
+                )
+
+                intr_pw0 = PWPinholeIntrinsics(
+                    fx=float(intr_primary.fx),
+                    fy=float(intr_primary.fy),
+                    cx=float(intr_primary.cx),
+                    cy=float(intr_primary.cy),
+                )
+                pw_cameras[primary_cam_id] = PWCameraFrame(
+                    rgb=np.asarray(rgb_primary),
+                    depth=np.asarray(depth_primary),
+                    intrinsics=intr_pw0,
+                    extrinsics=np.asarray(T_primary, dtype=np.float32).reshape(4, 4),
+                )
+
+            if rgb_primary is None or depth_primary is None or intr_primary is None or T_primary is None:
+                raise ValueError("Missing primary camera data")
 
             if pw is not None and bool(pw.enabled):
                 ts_s = float(obs.t_client_send_ns) * 1e-9
                 try:
                     pw.push_and_maybe_build(
-                        cam_id=str(obs.cam_id) if obs.cam_id is not None else str(cfg.cam_id),
+                        cameras=pw_cameras,
                         step_id=int(obs.step_id),
                         ts_s=float(ts_s),
-                        rgb=np.asarray(rgb),
-                        depth=np.asarray(depth),
-                        intr=intr,
-                        T_base_cam=T_base_cam,
                         q=np.asarray(obs.q, dtype=np.float32),
                         gripper=float(obs.gripper),
                     )
@@ -632,11 +761,11 @@ async def _handle_connection(
                     pw.reset()
 
             pcd_base = rgbd_to_pointcloud_base(
-                depth=np.asarray(depth),
-                rgb=np.asarray(rgb),
-                intr=intr,
-                T_base_cam=T_base_cam,
-                depth_unit_scale=float(depth_unit_scale),
+                depth=np.asarray(depth_primary),
+                rgb=np.asarray(rgb_primary),
+                intr=intr_primary,
+                T_base_cam=T_primary,
+                depth_unit_scale=float(depth_unit_scale_primary),
                 depth_min_m=float(depth_min_m),
                 depth_max_m=float(depth_max_m),
                 stride=int(stride),

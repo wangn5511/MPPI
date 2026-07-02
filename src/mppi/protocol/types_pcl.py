@@ -36,6 +36,8 @@ class ObsPCL:
     depth_unit_scale: Optional[float] = None
     T_base_cam: Optional[Any] = None
 
+    cameras: Optional[Dict[str, Dict[str, Any]]] = None
+
     def to_payload(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "t_client_send_ns": int(self.t_client_send_ns),
@@ -71,6 +73,9 @@ class ObsPCL:
             payload["depth_unit_scale"] = float(self.depth_unit_scale)
         if self.T_base_cam is not None:
             payload["T_base_cam"] = self.T_base_cam
+
+        if self.cameras is not None:
+            payload["cameras"] = {str(k): dict(v) for k, v in dict(self.cameras).items()}
         return payload
 
     @staticmethod
@@ -102,6 +107,11 @@ class ObsPCL:
                 float(payload["depth_unit_scale"]) if "depth_unit_scale" in payload and payload["depth_unit_scale"] is not None else None
             ),
             T_base_cam=(payload.get("T_base_cam", None)),
+            cameras=(
+                {str(k): dict(v) for k, v in dict(payload["cameras"]).items()}
+                if "cameras" in payload and isinstance(payload["cameras"], dict)
+                else None
+            ),
         )
 
 

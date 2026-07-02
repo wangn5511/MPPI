@@ -40,6 +40,8 @@ class WorkspaceFilterConfig:
     stability_apply_to_exists: bool = False
     stability_apply_to_confidence: bool = True
 
+    strict_all_time_enabled: bool = True
+
     def __post_init__(self) -> None:
         mn = tuple(float(x) for x in self.workspace_min)
         mx = tuple(float(x) for x in self.workspace_max)

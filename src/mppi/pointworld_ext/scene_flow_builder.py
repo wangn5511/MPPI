@@ -12,6 +12,7 @@ from mppi.pointworld_ext.geometry import (
     compute_workspace_mask_2d,
     invert_T,
     lift_tracked_pixels_to_3d,
+    project_points_to_pixels,
     transform_points,
 )
 from mppi.pointworld_ext.input_config import PointWorldInputConfig
@@ -258,8 +259,19 @@ class _RobotMask2DBuilder:
         H = int(height)
         W = int(width)
         robot_mask = np.zeros((H, W), dtype=np.uint8)
-        standard_circle_radius = 30
-        gripper_circle_radius = 20
+
+        ref_H, ref_W = 180.0, 320.0
+        scale = min(float(H) / ref_H, float(W) / ref_W)
+        if not np.isfinite(scale) or scale <= 0.0:
+            scale = 1.0
+
+        standard_circle_radius = max(1, int(round(30.0 * scale)))
+        gripper_circle_radius = max(1, int(round(20.0 * scale)))
+
+        kernel_size = max(3, int(round(30.0 * scale)))
+        if (kernel_size % 2) == 0:
+            kernel_size += 1
+
         gripper_keywords = ["finger", "knuckle", "robotiq"]
 
         for i, mesh in enumerate(fk_result.keys()):
@@ -284,7 +296,7 @@ class _RobotMask2DBuilder:
                 if 0 <= x < W and 0 <= y < H:
                     cv2.circle(robot_mask, (int(x), int(y)), int(circle_radius), color=1, thickness=-1)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (30, 30))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(kernel_size), int(kernel_size)))
         robot_mask = cv2.morphologyEx(robot_mask, cv2.MORPH_CLOSE, kernel)
         return robot_mask.astype(bool)
 
@@ -429,7 +441,7 @@ class OnlineSceneFlowBuilder:
                     workspace_min=self.cfg.workspace_filter.workspace_min,
                     workspace_max=self.cfg.workspace_filter.workspace_max,
                 )
-                ws_ok[t] = keep_ws
+                ws_ok[t] = keep_ws & z_ok
 
                 if robot_spheres_base is None:
                     keep_robot = np.ones((q0.shape[0],), dtype=bool)
@@ -483,6 +495,15 @@ class OnlineSceneFlowBuilder:
             run_thr = int(self.cfg.workspace_filter.stability_ws_run_len_thresh)
             stable = (r_ws >= thr) & (mx >= run_thr)
 
+            strict_enabled = bool(getattr(self.cfg.workspace_filter, "strict_all_time_enabled", False))
+            strict_all = np.all(ws_ok, axis=0) if ws_ok.size else np.zeros((q0.shape[0],), dtype=bool)
+
+            if strict_enabled:
+                exists2 = exists & strict_all[None, :]
+                xyz_base = np.where(exists2[..., None], xyz_base, np.zeros_like(xyz_base))
+                conf_out = np.where(exists2, conf_out, 0.0).astype(np.float32)
+                exists = exists2
+
             if bool(self.cfg.workspace_filter.stability_apply_to_confidence):
                 conf_out = (conf_out * r_ws[None, :]).astype(np.float32)
 
@@ -491,6 +512,8 @@ class OnlineSceneFlowBuilder:
                 xyz_base = np.where(exists2[..., None], xyz_base, np.zeros_like(xyz_base))
                 conf_out = np.where(exists2, conf_out, 0.0).astype(np.float32)
                 exists = exists2
+
+            stable_mask0 = (stable & strict_all) if strict_enabled else stable
 
             per_cam_xyz[cam_name] = xyz_base
             per_cam_exists[cam_name] = exists
@@ -542,7 +565,7 @@ class OnlineSceneFlowBuilder:
                     uv_tracks=uv_tracks,
                     visibility=visibility,
                     confidence=confidence,
-                    stable_mask0=stable,
+                    stable_mask0=stable_mask0,
                     new_query_index=shift,
                     rgb0=rgb_shift,
                     depth0=depth_shift,
