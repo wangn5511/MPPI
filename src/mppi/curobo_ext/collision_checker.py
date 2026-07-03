@@ -87,6 +87,10 @@ def _fk_T_base_link(urdf_path: str, q7: np.ndarray, link_name: str) -> np.ndarra
     return T[0].detach().cpu().numpy().astype(np.float32)
 
 
+def fk_T_base_link(*, urdf_path: str, q7: np.ndarray, link_name: str) -> np.ndarray:
+    return _fk_T_base_link(str(urdf_path), np.asarray(q7, dtype=np.float32).reshape(7), str(link_name))
+
+
 def _require_curobo_v2():
     ensure_sys_path_for_runtime()
     try:

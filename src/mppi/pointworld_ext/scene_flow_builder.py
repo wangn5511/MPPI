@@ -433,7 +433,13 @@ class OnlineSceneFlowBuilder:
                 intr: PinholeIntrinsics = cam.intrinsics
                 depth_t = cam.depth
 
-                xyz_cam, z_ok = lift_tracked_pixels_to_3d(depth_t, uv_tracks[t], intr=intr)
+                xyz_cam, z_ok = lift_tracked_pixels_to_3d(
+                    depth_t,
+                    uv_tracks[t],
+                    intr=intr,
+                    depth_min_m=float(self.cfg.tracking.depth_min_m),
+                    depth_max_m=float(self.cfg.tracking.depth_max_m),
+                )
                 xyzb = transform_points(cam.extrinsics, xyz_cam.reshape(-1, 3)).reshape(q0.shape[0], 3)
 
                 keep_ws = apply_workspace_mask_to_points(

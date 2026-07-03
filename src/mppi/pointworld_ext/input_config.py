@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
+import numpy as np
+
 
 Vec3 = Tuple[float, float, float]
 
@@ -21,6 +23,8 @@ class CameraConfig:
 class TrackingConfig:
     max_query_points_per_camera: int
     min_track_confidence: float = 0.0
+    depth_min_m: float = 0.0
+    depth_max_m: float = 4.0
 
     def __post_init__(self) -> None:
         if int(self.max_query_points_per_camera) < 1:
@@ -28,6 +32,11 @@ class TrackingConfig:
         c = float(self.min_track_confidence)
         if not (0.0 <= c <= 1.0):
             raise ValueError("min_track_confidence must be in [0, 1]")
+
+        dmin = float(self.depth_min_m)
+        dmax = float(self.depth_max_m)
+        if not np.isfinite([dmin, dmax]).all() or dmin < 0.0 or dmax <= dmin:
+            raise ValueError("depth_min_m/depth_max_m must satisfy 0 <= depth_min_m < depth_max_m")
 
 
 @dataclass(frozen=True)

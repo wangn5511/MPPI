@@ -1,0 +1,10 @@
+numpy
+msgpack
+websockets
+opencv-python
+pillow
+scipy
+torch
+pytorch_kinematics
+urdfpy
+trimesh

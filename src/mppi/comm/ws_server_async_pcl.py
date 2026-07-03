@@ -20,7 +20,7 @@ from mppi.curobo_ext.check_depth_pcl import (
     parse_obs_camera_params,
     rgbd_to_pointcloud_base,
 )
-from mppi.curobo_ext.collision_checker import CuRoboCollisionConfig, get_curobo_collision_checker
+from mppi.curobo_ext.collision_checker import CuRoboCollisionConfig, fk_T_base_link, get_curobo_collision_checker
 from mppi.curobo_ext.scene_builder import SceneBuildConfig, build_scene_points_base_and_colors_from_pcd_back_cam
 from mppi.costs.pointworld_cost import PointWorldCostConfig
 from mppi.protocol.msgpack_codec import decode_message, encode_message
@@ -433,6 +433,10 @@ class _PointWorldRuntime:
     last_step_id: int = -1
     last_ts_s: float = float("nan")
 
+    consecutive_build_failures: int = 0
+    disabled_until_ts_s: float = 0.0
+    last_build_error: str = ""
+
     def reset(self) -> None:
         self.window.reset()
         self.query_manager.reset()
@@ -441,6 +445,9 @@ class _PointWorldRuntime:
         self.last_hw_by_camera.clear()
         self.last_step_id = -1
         self.last_ts_s = float("nan")
+        self.consecutive_build_failures = 0
+        self.disabled_until_ts_s = 0.0
+        self.last_build_error = ""
 
     def push_and_maybe_build(
         self,
@@ -486,7 +493,31 @@ class _PointWorldRuntime:
         if not self.window.is_ready():
             return None
 
-        scene = self.builder.build(window_shift=1, robot_spheres_base=None)
+        if float(ts_s) < float(self.disabled_until_ts_s):
+            return self.last_pointworld_obs
+
+        try:
+            scene = self.builder.build(window_shift=1, robot_spheres_base=None)
+        except Exception as e:
+            self.consecutive_build_failures = int(self.consecutive_build_failures) + 1
+            self.last_build_error = type(e).__name__
+
+            fail_thr = int(os.getenv("MPPI_PW_BUILD_FAIL_THRESH", "3"))
+            cooldown_s = float(os.getenv("MPPI_PW_BUILD_COOLDOWN_S", "1.0"))
+            if fail_thr < 1:
+                fail_thr = 1
+            if cooldown_s < 0.0:
+                cooldown_s = 0.0
+
+            if int(self.consecutive_build_failures) >= int(fail_thr):
+                self.disabled_until_ts_s = float(ts_s) + float(cooldown_s)
+
+            return self.last_pointworld_obs
+
+        self.consecutive_build_failures = 0
+        self.disabled_until_ts_s = 0.0
+        self.last_build_error = ""
+
         steps = self.window.get_window()
         ts = np.asarray([float(s.timestamp) for s in steps], dtype=np.float64)
         q_win = np.stack([np.asarray(s.joint_positions, dtype=np.float32).reshape(-1)[:7] for s in steps], axis=0)
@@ -499,10 +530,38 @@ class _PointWorldRuntime:
             gripper_positions=g_win,
         )
 
+        T = int(q_win.shape[0])
+        gripper_open = (g_win < 0.1).astype(bool).reshape(int(T), 1)
+
         obs: Dict[str, Any] = dict(batch)
         obs["timestamps"] = ts
         obs["joint_positions_window"] = q_win
         obs["gripper_positions_window"] = g_win
+
+        # droid contract proprio fields
+        obs["joint_positions"] = q_win
+        obs["gripper_positions"] = g_win.reshape(int(T), 1)
+        obs["gripper_open"] = gripper_open
+
+        if _env_bool("MPPI_PW_GRIPPER_POSE_ENABLED", "1"):
+            urdf_path = self.cfg.urdf_path
+            if not urdf_path:
+                raise ValueError("cfg.urdf_path is required to compute gripper_pose. Set MPPI_PW_URDF_PATH.")
+            link_name = os.getenv("MPPI_PW_GRIPPER_LINK", "robotiq_85_base_link").strip() or "robotiq_85_base_link"
+            poses = [fk_T_base_link(urdf_path=str(urdf_path), q7=q_win[i], link_name=link_name) for i in range(int(T))]
+            obs["gripper_pose"] = np.stack(poses, axis=0).astype(np.float32, copy=False)
+
+        raw_idx = os.getenv("MPPI_PW_TASK_POINT_INDICES", "").strip()
+        raw_goal = os.getenv("MPPI_PW_TASK_GOAL_XYZ", "").strip()
+        if raw_idx and raw_goal:
+            try:
+                idx = np.asarray([int(p.strip()) for p in raw_idx.split(",") if p.strip()], dtype=np.int32)
+                goal = np.asarray([float(p.strip()) for p in raw_goal.split(",") if p.strip()], dtype=np.float32)
+                if int(idx.size) > 0 and int(goal.size) == 3:
+                    obs["task_point_indices"] = idx
+                    obs["task_goal_positions"] = goal.reshape(3)
+            except Exception:
+                pass
 
         self.last_pointworld_obs = obs
         return obs
@@ -522,6 +581,9 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
     min_conf = float(_env_f("MPPI_PW_MIN_TRACK_CONFIDENCE", "0.0"))
     rng_seed = _env_i("MPPI_PW_QUERY_RNG_SEED", "0")
 
+    pw_depth_min_m = float(_env_f("MPPI_PW_DEPTH_MIN_M", "0.0"))
+    pw_depth_max_m = float(_env_f("MPPI_PW_DEPTH_MAX_M", "4.0"))
+
     ws_min = _env_vec3("MPPI_PW_WORKSPACE_MIN", "0.00,-0.38,-0.30")
     ws_max = _env_vec3("MPPI_PW_WORKSPACE_MAX", "0.80,0.30,1.20")
 
@@ -534,7 +596,12 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
 
     urdf_path = os.getenv("MPPI_PW_URDF_PATH", os.getenv("MPPI_URDF_PATH", "")).strip() or None
 
-    tracking = TrackingConfig(max_query_points_per_camera=int(max_q), min_track_confidence=float(min_conf))
+    tracking = TrackingConfig(
+        max_query_points_per_camera=int(max_q),
+        min_track_confidence=float(min_conf),
+        depth_min_m=float(pw_depth_min_m),
+        depth_max_m=float(pw_depth_max_m),
+    )
     workspace = WorkspaceFilterConfig(workspace_min=ws_min, workspace_max=ws_max)
     robot = RobotFilterConfig(
         robot_mask_margin_m=float(os.getenv("MPPI_PW_ROBOT_MASK_MARGIN_M", "0.02")),
@@ -639,8 +706,8 @@ async def _handle_connection(
             request_id = str(envelope["request_id"])
             obs = ObsPCL.from_payload(dict(envelope["payload"]))
 
-            depth_min_m = _env_f("MPPI_PCL_DEPTH_MIN_M", "0.05")
-            depth_max_m = _env_f("MPPI_PCL_DEPTH_MAX_M", "2.0")
+            depth_min_m = _env_f("MPPI_PCL_DEPTH_MIN_M", "0.0")
+            depth_max_m = _env_f("MPPI_PCL_DEPTH_MAX_M", "4.0")
             stride = _env_i("MPPI_PCL_STRIDE", "1")
 
             primary_cam_id = str(obs.cam_id) if obs.cam_id is not None else str(cfg.cam_id)

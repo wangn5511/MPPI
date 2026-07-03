@@ -11,8 +11,8 @@ def _env_vec3(name: str, default: str):
     return tuple(float(x) for x in os.environ.get(name, default).split(","))
 
 
-PCD = os.environ.get("MPPI_SCENE_PCD_NPZ", "/home/wangyuhan/MPPI/data/test/scene_points.npz")
-OUT = os.environ.get("MPPI_SCENE_PCD_NPZ_OUT", "/home/wangyuhan/MPPI/data/test/scene_points_with_cuboids.npz")
+PCD = os.environ.get("MPPI_SCENE_PCD_NPZ", "/home/wangyuhan/MPPI/data/robot_mask_debug/frame_0000_base.npz")
+OUT = os.environ.get("MPPI_SCENE_PCD_NPZ_OUT", "/home/wangyuhan/MPPI/data/robot_mask_debug/scene_points_with_cuboids.npz")
 
 VOXEL_SIZE_M = float(os.environ.get("MPPI_SCENE_VOXEL_SIZE_M", "0.01"))
 PADDING_M = float(os.environ.get("MPPI_SCENE_PADDING_M", "0.02"))

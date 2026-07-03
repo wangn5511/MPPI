@@ -325,6 +325,11 @@ class PointWorldCostModel:
             batch_size=1,
             max_scene_points=int(self.max_scene_points),
         )
+
+        if "task_point_indices" in pointworld_obs and "task_goal_positions" in pointworld_obs:
+            scene["task_point_indices"] = np.asarray(pointworld_obs["task_point_indices"], dtype=np.int64).reshape(-1)
+            scene["task_goal_positions"] = np.asarray(pointworld_obs["task_goal_positions"], dtype=np.float32)
+
         if int(scene["scene_flows"].shape[1]) != int(T):
             raise ValueError(
                 f"PointWorld scene window T={int(scene['scene_flows'].shape[1])} must match q_traj horizon T={int(T)}"
@@ -365,6 +370,8 @@ class PointWorldCostModel:
             if isinstance(value, np.ndarray):
                 if value.dtype == np.bool_:
                     out[key] = torch.as_tensor(value, device=device_t, dtype=torch.bool)
+                elif np.issubdtype(value.dtype, np.integer):
+                    out[key] = torch.as_tensor(value, device=device_t, dtype=torch.long)
                 else:
                     out[key] = torch.as_tensor(value, device=device_t, dtype=torch.float32)
             else:
@@ -442,6 +449,9 @@ class PointWorldCostModel:
                     scene_exists=batch_t["scene_exists"],
                     model_confidence=model_conf,
                     track_confidence=track_conf_t,
+                    scene_p0=scene_flows_t[:, 0],
+                    task_point_indices=scene_t.get("task_point_indices"),
+                    task_goal_positions=scene_t.get("task_goal_positions"),
                     cfg=self.cfg.cost,
                 ).detach().cpu().numpy().astype(np.float32)
             )

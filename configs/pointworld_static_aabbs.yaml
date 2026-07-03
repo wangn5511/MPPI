@@ -1,0 +1,31 @@
+frame: base
+units: m
+source:
+  episode: /home/datasets/FrankaNav/ep_00152
+  pcd: /home/wangyuhan/MPPI/data/robot_mask_debug/frame_0000_masked.npz
+  selected_cuboids: [1, 2, 4]
+  rejected_cuboids: [3]
+
+inflation_default_m: 0.03
+
+obstacles:
+  - name: obs_01
+    center: [0.68499994, -0.16000001, 0.09999999]
+    dims:   [0.22999996,  0.34000000, 0.22000000]
+    aabb_min: [0.56999996, -0.33000001, -0.01000001]
+    aabb_max: [0.79999992,  0.00999999,  0.20999999]
+    inflation_m: 0.03
+
+  - name: obs_02
+    center: [0.65999997, 0.05999999, 0.09499999]
+    dims:   [0.21999997, 0.21999998, 0.20999999]
+    aabb_min: [0.54999998, -0.05000000, -0.01000001]
+    aabb_max: [0.76999995,  0.16999999,  0.19999999]
+    inflation_m: 0.03
+
+  - name: obs_04
+    center: [0.31999999, 0.02999999, 0.02000000]
+    dims:   [0.26000000, 0.44000000, 0.05999999]
+    aabb_min: [0.19000000, -0.19000001, -0.01000000]
+    aabb_max: [0.44999999,  0.25000000,  0.04999999]
+    inflation_m: 0.03
