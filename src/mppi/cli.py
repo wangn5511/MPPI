@@ -136,19 +136,19 @@ def main(argv: Optional[list[str]] = None) -> None:
     p_server.add_argument("--port", type=int, default=None)
     p_server.add_argument("--open-loop-horizon", type=int, default=None)
     p_server.add_argument("--policy", type=str, default=None)
+    p_server.add_argument("--cam-id", type=str, default=None)
 
     p_client = sub.add_parser("client")
     p_client.add_argument("--url", type=str, default=None)
-    p_client.add_argument("--run-seconds", type=float, default=None)
-    p_client.add_argument("--control-hz", type=float, default=None)
-    p_client.add_argument("--open-loop-horizon", type=int, default=None)
+    p_client.add_argument("--rgb", type=str, default=None)
+    p_client.add_argument("--depth", type=str, default=None)
     p_client.add_argument("--request-timeout-s", type=float, default=None)
+    p_client.add_argument("--cam-id", type=str, default=None)
+    p_client.add_argument("--depth-unit-scale", type=float, default=None)
     p_client.add_argument("--gripper", type=float, default=0.0)
+    p_client.add_argument("--step-id", type=int, default=0)
     p_client.add_argument("--initial-q", type=str, default="")
-    p_client.add_argument("--pcd-npz", type=str, default="")
-    p_client.add_argument("--pcd-a", type=str, default="")
-    p_client.add_argument("--pcd-b", type=str, default="")
-    p_client.add_argument("--ab-alternate", action="store_true")
+    p_client.add_argument("--print-actions", action="store_true")
 
     p_smoke = sub.add_parser("curobo-smoke")
     p_smoke.add_argument("--device", type=str, default="cuda:0")
@@ -166,21 +166,22 @@ def main(argv: Optional[list[str]] = None) -> None:
         cfg = _load_config(args.config)
 
     if args.cmd == "server":
-        from mppi.comm.ws_server_async import main as server_main
+        from mppi.comm.ws_server_async_pcl import main as server_main
 
         host = args.host if args.host is not None else _get(cfg, "server.host", "0.0.0.0")
-        port = args.port if args.port is not None else int(_get(cfg, "server.port", 9010))
+        port = args.port if args.port is not None else int(_get(cfg, "server.port", 9011))
         horizon = (
             args.open_loop_horizon
             if args.open_loop_horizon is not None
-            else int(_get(cfg, "control.open_loop_horizon", 8))
+            else int(_get(cfg, "control.open_loop_horizon", 11))
         )
-        policy = args.policy if args.policy is not None else str(_get(cfg, "policy.name", "dummy_hold"))
-        server_main(host=host, port=port, open_loop_horizon=horizon, policy=policy)
+        policy = args.policy if args.policy is not None else str(_get(cfg, "policy.name", "mppi_joint"))
+        cam_id = args.cam_id if args.cam_id is not None else str(_get(cfg, "camera.cam_id", "back"))
+        server_main(["--host", str(host), "--port", str(int(port)), "--open-loop-horizon", str(int(horizon)), "--policy", str(policy), "--cam-id", str(cam_id)])
         return
 
     if args.cmd == "client":
-        from mppi.comm.ws_client_sync import main as client_main
+        from mppi.comm.ws_client_sync_pcl import main as client_main
 
         def _parse_q_csv(s: str) -> list[float]:
             parts = [p.strip() for p in str(s).split(",") if p.strip()]
@@ -188,43 +189,45 @@ def main(argv: Optional[list[str]] = None) -> None:
                 raise ValueError("--initial-q must be 7 comma-separated floats")
             return [float(x) for x in parts]
 
-        url = args.url if args.url is not None else str(_get(cfg, "client.url", "ws://127.0.0.1:9010"))
-        run_seconds = (
-            float(args.run_seconds)
-            if args.run_seconds is not None
-            else float(_get(cfg, "client.run_seconds", 60.0))
-        )
-        control_hz = (
-            float(args.control_hz)
-            if args.control_hz is not None
-            else float(_get(cfg, "control.frequency", 20.0))
-        )
-        horizon = (
-            int(args.open_loop_horizon)
-            if args.open_loop_horizon is not None
-            else int(_get(cfg, "control.open_loop_horizon", 8))
-        )
+        url = args.url if args.url is not None else str(_get(cfg, "client.url", "ws://127.0.0.1:9011"))
+        rgb = args.rgb if args.rgb is not None else str(_get(cfg, "client.rgb", ""))
+        depth = args.depth if args.depth is not None else str(_get(cfg, "client.depth", ""))
+        if not str(rgb).strip() or not str(depth).strip():
+            raise ValueError("PCL client requires --rgb and --depth")
+
         request_timeout_s = (
             float(args.request_timeout_s)
             if args.request_timeout_s is not None
             else float(_get(cfg, "client.request_timeout_s", 2.0))
         )
-
+        cam_id = args.cam_id if args.cam_id is not None else str(_get(cfg, "camera.cam_id", "back"))
         q0 = _parse_q_csv(str(args.initial_q)) if str(args.initial_q).strip() else None
+        q_csv = "" if q0 is None else ",".join(str(float(x)) for x in q0)
 
-        client_main(
-            url=str(url),
-            run_seconds=float(run_seconds),
-            control_hz=float(control_hz),
-            open_loop_horizon=int(horizon),
-            request_timeout_s=float(request_timeout_s),
-            gripper=float(args.gripper),
-            initial_q=q0,
-            pcd_npz=(str(args.pcd_npz) if str(args.pcd_npz).strip() else None),
-            pcd_a_npz=(str(args.pcd_a) if str(args.pcd_a).strip() else None),
-            pcd_b_npz=(str(args.pcd_b) if str(args.pcd_b).strip() else None),
-            ab_alternate=bool(args.ab_alternate),
-        )
+        argv2 = [
+            "--url",
+            str(url),
+            "--rgb",
+            str(rgb),
+            "--depth",
+            str(depth),
+            "--request-timeout-s",
+            str(float(request_timeout_s)),
+            "--cam-id",
+            str(cam_id),
+            "--gripper",
+            str(float(args.gripper)),
+            "--step-id",
+            str(int(args.step_id)),
+        ]
+        if args.depth_unit_scale is not None:
+            argv2.extend(["--depth-unit-scale", str(float(args.depth_unit_scale))])
+        if str(q_csv).strip():
+            argv2.extend(["--initial-q", str(q_csv)])
+        if bool(args.print_actions):
+            argv2.append("--print-actions")
+
+        client_main(argv2)
         return
 
     if args.cmd == "curobo-smoke":

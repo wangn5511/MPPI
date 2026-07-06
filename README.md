@@ -3,63 +3,50 @@
 本仓库提供一个面向 Franka 机械臂的 MPPI（Model Predictive Path Integral）关节空间推理服务。当前主链路收敛为：
 
 - PCL 链路（schema_version=100，端口 9011）：客户端发送 RGB+Depth（可压缩）+ 相机标识/参数；服务器端在线解码、反投影生成 base 点云，并接入 PointWorld 在线 window/tracking 以产出 `scene_flows` 等观测字段。
-- V1 链路（schema_version=1，端口 9010）：仅作为 Legacy baseline（纯通信/MPPI 早期测试），README 默认不再推荐使用。
 
 本 README 的目标是提供一条可复制的“本地回放验收”标准入口，并指出关键文件位置与清理建议。
 
 ---
 
-## 1. 快速上手（建议同事按这里跑通）
+## 1. 快速上手（PCL + PointWorld：本地回放验收）
 
 ### 1.1 基础：设置 PYTHONPATH
 ```bash
 export PYTHONPATH=/home/wangyuhan/MPPI/src:$PYTHONPATH
 ```
 
-### 1.2 启动 V1 server（端口 9010）
-- dummy_hold：不跑推理，只回传 hold 动作（用于纯通信测试）
+### 1.2 一键：起 server + 回放 + 验收（推荐）
+- 标准入口：`tests/run_pw_replay_acceptance.sh`
+- profile：`no_pw` / `obs_only` / `obs_infl`
+
+#### A) 原生 episode（双视角 back+side）
 ```bash
-python3 -m mppi.cli server --host 0.0.0.0 --port 9010 --open-loop-horizon 8 --policy dummy_hold
+EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
+DUAL_VIEW=1 \
+bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh all obs_infl
 ```
 
-- mppi_joint：跑 MPPI 推理（可选接 cuRobo/场景）
+#### B) data.json（单视角 back）
 ```bash
-python3 -m mppi.cli server --host 0.0.0.0 --port 9010 --open-loop-horizon 8 --policy mppi_joint
+JSON_PATH=/home/wangyuhan/MPPI/data/test/data.json \
+DATA_ROOT=/home/datasets/FrankaNav/test \
+DUAL_VIEW=0 \
+bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh all obs_only
 ```
 
-### 1.3 V1 client（发送 q/gripper/可选 pcd）
+### 1.3 单次请求（PCL client）
 ```bash
-python3 -m mppi.cli client --url ws://127.0.0.1:9010 --run-seconds 10 --control-hz 20 --open-loop-horizon 8
-```
-如果要固定点云输入（npz 内含 points/colors）：
-```bash
-python3 -m mppi.cli client --url ws://127.0.0.1:9010 --pcd-npz /home/wangyuhan/MPPI/data/test/scene_points.ply
-```
-注：V1 client 的点云加载默认读 npz（见 `src/mppi/comm/ws_client_sync.py::_load_pcd_npz`），如果你提供的是 ply，需要先转换或改代码/脚本。
-
-### 1.4 启动 PCL server（端口 9011，RGB+Depth -> 点云 -> 场景）
-建议直接用现成脚本配置环境变量：
-```bash
-bash /home/wangyuhan/MPPI/scripts/test_cuRobo_pcl.sh
-```
-脚本最终执行：
-```bash
-python3 -m mppi.comm.ws_server_async_pcl --host 0.0.0.0 --port 9011 --open-loop-horizon 8 --policy mppi_joint --cam-id back
-```
-注：如果启用 PointWorld（在线 window + tracking + pointworld_cost_fn 插槽），PointWorld 强制要求 `open-loop-horizon=11`，否则 server 会拒绝启动。
-
-注：PCL server 的 `timing_policy` 会附带 `pw{0/1}:{reason}:{ms}`（例如 `pw1:ok:3.2ms` / `pw0:missing_inputs:0.0ms`）用于观察 PointWorld cost 插槽是否启用与是否降级。
-
-### 1.5 PCL client（发送 RGB+Depth）
-- 单次请求（本地文件 rgb/depth）：
-```bash
-python3 -m mppi.comm.ws_client_sync_pcl --url ws://127.0.0.1:9011 --rgb <rgb_path> --depth <depth_path> --cam-id back --print-actions
+python3 -m mppi.comm.ws_client_sync_pcl \
+  --url ws://127.0.0.1:9011 \
+  --rgb <rgb_path> \
+  --depth <depth_path> \
+  --cam-id back \
+  --print-actions
 ```
 
-- 回放数据集（json 里引用 images/depths 路径）：
-```bash
-python3 /home/wangyuhan/MPPI/scripts/playback_client_pcl.py --url ws://127.0.0.1:9011 --json <data.json> --data-root <data_root>
-```
+关键约束：
+- PointWorld window 强制 `open-loop-horizon=11`（验收脚本已固化）
+- 静态 AABB 默认：`configs/pointworld_static_aabbs.json`
 
 ---
 
@@ -79,16 +66,12 @@ python3 /home/wangyuhan/MPPI/scripts/playback_client_pcl.py --url ws://127.0.0.1
   - 同事做“通信功能检测”时优先用这里的 server/client 快速验证链路
 - `src/mppi/comm/`
   - 通信层（websocket + msgpack）
-  - **V1：**
-    - `ws_server_async.py`：服务端（schema_version=1），接收 `infer_request`，返回 `infer_response`
-    - `ws_client_sync.py`：客户端/执行器（周期性请求、统计 RTT/jitter）
   - **PCL：**
-    - `ws_server_async_pcl.py`：服务端（schema_version=100），接收 RGB/Depth，在线反投影生成点云，再走 mppi 推理/碰撞
+    - `ws_server_async_pcl.py`：服务端（schema_version=100），接收 RGB/Depth，在线反投影生成点云，并接入 PointWorld window/tracking
     - `ws_client_sync_pcl.py`：客户端（把 RGB 编成 JPEG，把 Depth 编成 npy+zlib 发给服务端）
 - `src/mppi/protocol/`
-  - `types.py`：V1 协议数据结构（ObsV1/InferRequestV1/InferResponseV1/ErrorV1）
   - `types_pcl.py`：PCL 协议数据结构（ObsPCL/InferRequestPCL/InferResponsePCL/ErrorPCL）
-  - `msgpack_codec.py`：msgpack 编解码（通信层所有消息都走这里）
+  - `msgpack_codec.py`：msgpack 编解码
 - `src/mppi/mpc/solver.py`
   - `JointMPPISolver`：MPPI 核心推理（采样、代价、退化策略、时间预算）
   - 场景构建入口：`build_scene_cuboids_from_pcd_back_cam(...)`
@@ -140,24 +123,9 @@ python3 /home/wangyuhan/MPPI/scripts/playback_client_pcl.py --url ws://127.0.0.1
 
 ---
 
-## 3. 通信协议（同事做通信检测重点关注）
+## 3. 通信协议（PCL）
 
-### 3.1 V1（schema_version = 1）
-- 请求 envelope：
-  - `type = "infer_request"`
-  - payload = `ObsV1`（包含 `q/gripper/step_id/t_client_send_ns`，可选 `pcd_back_cam`）
-- 响应 envelope：
-  - `type = "infer_response"`
-  - payload = `ActionChunkV1`（包含 actions、时戳、server_timing）
-- 错误：
-  - `type = "error"`，payload 包含 `code/message`
-
-代码位置：
-- `src/mppi/protocol/types.py`
-- server：`src/mppi/comm/ws_server_async.py`
-- client：`src/mppi/comm/ws_client_sync.py`
-
-### 3.2 PCL（schema_version = 100）
+### 3.1 PCL（schema_version = 100）
 - 请求 envelope：
   - `type = "infer_request_pcl"`
   - payload = `ObsPCL`：支持 `rgb_bytes(jpeg)` + `depth_bytes(npy_zlib)`，以及 `cam_id`/`intrinsics`/`T_base_cam`
@@ -218,9 +186,19 @@ python3 /home/wangyuhan/MPPI/scripts/playback_client_pcl.py --url ws://127.0.0.1
 
 ---
 
-## 6. Legacy（计划逐步删减的历史内容）
+## 6. 清理建议（只保留 PCL + PointWorld）
 
-如果你决定“只保留 PCL + PointWorld”这一条主链路，则可以删除：
-- V1 链路（端口 9010）相关脚本与入口：`scripts/test_cuRobo.sh`、`scripts/run_client_cpu.sh`、`scripts/playback_client.py`
-- PCL 老回放脚本：`scripts/playback_client_pcl.py`（已被 `tests/pw_replay_acceptance.py` 取代）
-- 冗余 wrapper：`scripts/run_server_gpu.sh`（仅薄封装 `test_cuRobo_pcl.sh`）
+建议直接删除下列冗余/历史入口，避免仓库入口爆炸：
+- V1 链路（端口 9010）相关脚本与代码：
+  - `scripts/test_cuRobo.sh`
+  - `scripts/run_client_cpu.sh`
+  - `scripts/playback_client.py`
+  - `src/mppi/comm/ws_server_async.py`
+  - `src/mppi/comm/ws_client_sync.py`
+  - `src/mppi/protocol/types.py`
+- PCL 老回放脚本（已被验收脚本覆盖）：
+  - `scripts/playback_client_pcl.py`
+- 冗余 wrapper：
+  - `scripts/run_server_gpu.sh`
+- 历史待办：
+  - `tests/real_todo.md`
