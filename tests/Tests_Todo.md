@@ -276,6 +276,94 @@ bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl
 - window ready 后持续 `pw1:ok:...ms`
 - `FINAL: PASS`
 
+### 4.6 加速路线图（基于 timing_breakdown 的稳定瓶颈）
+现象（见 `data/pw_acceptance/<profile>/server/*.json` 的 `timing_breakdown`）：
+- `t_pw_build_ms`：每帧稳定 ~3.3s（PointWorld build 持续重成本，并非 step10 warmup 偶发）
+- `pw_ms`：每帧稳定 ~5–6s，且 `t_solver_ms ≈ pw_ms`（solver 的大头就是 PW cost term）
+- 非瓶颈：`t_decode_ms≈0.1ms`、`t_cameras_ms≈10ms`、`t_pcd_ms≈6–8ms`（pcd_points ~10^5 级别也不慢）
+
+瓶颈在代码中的对应位置：
+- PW build（`t_pw_build_ms`）：`mppi/comm/ws_server_async_pcl.py` → `pw.push_and_maybe_build()` → `OnlineSceneFlowBuilder.build()` → `CoTrackerOnlinePointTracker.track_window()`（每相机一次，双视角会叠加）
+- PW cost（`pw_ms`）：`mppi/mpc/solver.py` → `_rollout_cost()` 调 `pointworld_cost_fn()` → `mppi/pointworld_ext/wrapper.py` → `build_scene_features_torch()`（包含 `dist2robot` 的 `torch.cdist` 循环）+ 模型前向
+
+#### 4.6.1 不改代码的“立刻可做”加速（建议先做这 4 个扫参）
+A) 降 MPPI 样本数 K（对 `pw_ms` 近似线性，收益最大）
+- 入口：server 读 `MPPI_NUM_SAMPLES`（默认 256）
+
+```bash
+for K in 256 128 64; do
+  echo "== K=${K} =="
+  EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
+  DUAL_VIEW=1 START_IDX=10 MAX_STEPS=12 \
+  MPPI_NUM_SAMPLES=${K} \
+  bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl || exit 1
+  echo ""
+done
+```
+
+B) 降 cost 侧 scene 点数 Ns（对 `dist2robot` 与模型前向都降负载）
+- 入口：`MPPI_PW_MAX_SCENE_POINTS`（默认会被 cap 到 `min(model_contract, 1024)`）
+
+```bash
+for NS in 1024 512 256 128; do
+  echo "== Ns=${NS} =="
+  EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
+  DUAL_VIEW=1 START_IDX=10 MAX_STEPS=12 \
+  MPPI_PW_MAX_SCENE_POINTS=${NS} \
+  bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl || exit 1
+  echo ""
+done
+```
+
+C) 降 build 侧 query 点数（直接砍 `t_pw_build_ms`，并避免 build 4096 点但 cost 只用 1024 的浪费）
+- 入口：`MPPI_PW_MAX_QUERY_POINTS_PER_CAMERA`（当前默认 2048 → 双视角总点数 4096）
+
+```bash
+for Q in 2048 1024 512 256; do
+  echo "== Q_per_cam=${Q} =="
+  EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
+  DUAL_VIEW=1 START_IDX=10 MAX_STEPS=12 \
+  MPPI_PW_MAX_QUERY_POINTS_PER_CAMERA=${Q} \
+  bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl || exit 1
+  echo ""
+done
+```
+
+D) 降 robot 点数 Nr（显著影响 `dist2robot` 计算量）
+- 入口：`MPPI_PW_MAX_ROBOT_POINTS`（默认会被 cap 到 `min(model_contract, 256)`）
+
+```bash
+for NR in 256 128 64 32; do
+  echo "== Nr=${NR} =="
+  EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
+  DUAL_VIEW=1 START_IDX=10 MAX_STEPS=12 \
+  MPPI_PW_MAX_ROBOT_POINTS=${NR} \
+  bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl || exit 1
+  echo ""
+done
+```
+
+补充（吞吐 sweet spot）：继续沿用 4.3 的 `MPPI_PW_EVAL_BATCH_SIZE` 扫参，并可以额外试 `64`（显存够的话）。
+
+#### 4.6.2 需要改代码的加速（如果目标是在线闭环，就要动这里）
+A) `t_pw_build_ms`：给 CoTracker 加 “iters/分辨率/fast path” 可调开关
+- 现状：`CoTrackerOnlinePointTracker.track_window()` 固定 `iters=6`，且走 `pred.model(...)` 路径
+- 建议：支持通过 env 调参（例如 `MPPI_PW_COTRACKER_ITERS=3/4/6`），并评估是否可以仅用 predictor 的输出（牺牲少量质量换大幅提速）
+
+B) `pw_ms`：`dist2robot` 是确定的重算（`flows.py: build_scene_features_torch`）
+- 现状：每帧每个 t 都做一次 `torch.cdist(p0, robot_t)`（还按 Ns 分块循环），对 `B=K` 很重
+- 建议：提供可切换的近似模式（用于在线）
+  - `dist2robot=t0_repeat`：只算 t=0 的 dist2robot，然后沿 T 维 repeat
+  - `dist2robot=none`：直接置零（用于上限测速/排除项）
+
+C) `pw_ms`：开启/验证 `torch.compile`
+- 现状：`PointWorldModelConfig.disable_compile` 默认 True（env `MPPI_PW_DISABLE_COMPILE` 默认 1）
+- 建议：在离线回放里打开 compile（`MPPI_PW_DISABLE_COMPILE=0`），允许首帧编译慢，但看稳定段是否显著降 `pw_ms`
+
+D) 多 GPU 并行（有多卡时）
+- 现状：`PointWorldCostModel` 支持 `device="cuda:0,cuda:1"` 多 replica 并行（线程池分片 B 维）
+- 建议：如果云端有两张卡，直接用多 device 分摊 `K` 的 cost 计算
+
 ---
 
 ## Stage 5：Franka↔云端联合测试（分级推进，双视角）
