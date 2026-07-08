@@ -1,56 +1,89 @@
 # MPPI
 
-本仓库提供一个面向 Franka 机械臂的 MPPI（Model Predictive Path Integral）关节空间推理服务。当前主链路收敛为：
+本仓库提供一个面向 Franka 机械臂的 MPPI 关节空间推理服务。
 
-- PCL 链路（schema_version=100，端口 9011）：客户端发送 RGB+Depth（可压缩）+ 相机标识/参数；服务器端在线解码、反投影生成 base 点云，并接入 PointWorld 在线 window/tracking 以产出 `scene_flows` 等观测字段。
+当前主链路收敛到 PCL 协议（schema_version=100，ws://<HOST>:9011）：
+- client 上行：双视角 back+side 的 RGB/Depth（可压缩）+ 当前关节 `q(7)` + `step_id/t_client_send_ns`
+- server 侧：在线解码与反投影得到 base 点云；可选接入 PointWorld window/tracking 产出 `scene_flows` 等观测；用 MPPI 求解并回包 `actions(T,8)`
 
-本 README 的目标是提供一条可复制的“本地回放验收”标准入口，并指出关键文件位置与清理建议。
+本 README 只讲两条主线，并给出可直接复制的启动命令：
+- 线 A：server 本机“数据回放/验收模式”（离线 episode_dir → 回放 client → `FINAL: PASS/FAIL`）
+- 线 B：Franka↔server “通信闭环模式”（先 shadow：只采集+回包校验，不执行；再 execute：安全门控后执行 `actions[0]`）
 
 ---
 
-## 1. 快速上手（PCL + PointWorld：本地回放验收）
+## 1) 快速上手
 
 ### 1.1 基础：设置 PYTHONPATH
 ```bash
 export PYTHONPATH=/home/wangyuhan/MPPI/src:$PYTHONPATH
 ```
 
-### 1.2 一键：起 server + 回放 + 验收（推荐）
-- 标准入口：`tests/run_pw_replay_acceptance.sh`
+### 1.2 线 A：本机回放验收（推荐标准入口）
+- 唯一推荐入口：`tests/run_pw_replay_acceptance.sh`
 - profile：`no_pw` / `obs_only` / `obs_infl`
 
-#### A) 原生 episode（双视角 back+side）
+原生 episode_dir（双视角 back+side）
 ```bash
 EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
 DUAL_VIEW=1 \
 bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh all obs_infl
 ```
 
-#### B) data.json（单视角 back）
+验收通过口径：脚本最终输出 `FINAL: PASS`，并在 `${MPPI_PW_ACCEPTANCE_DUMP_DIR}` 下产生 server 摘要 json。
+
+### 1.3 线 B：Franka↔server 通信（先 dummy_hold，再 mppi_joint）
+
+0) 云端/本机启动 server（只测通信稳定性：dummy_hold）
 ```bash
-JSON_PATH=/home/wangyuhan/MPPI/data/test/data.json \
-DATA_ROOT=/home/datasets/FrankaNav/test \
-DUAL_VIEW=0 \
-bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh all obs_only
+cd /home/wangyuhan/MPPI
+
+MPPI_PCL_CAM_INFO_BACK_PATH=/home/wangyuhan/MPPI/configs/back_cam_info.yaml \
+MPPI_PCL_T_BASE_CAM_BACK_PATH=/home/wangyuhan/MPPI/configs/T_base_cam_back.yaml \
+MPPI_PCL_CAM_INFO_SIDE_PATH=/home/wangyuhan/MPPI/configs/side_cam_info.yaml \
+MPPI_PCL_T_BASE_CAM_SIDE_PATH=/home/wangyuhan/MPPI/configs/T_base_cam_side.yaml \
+MPPI_PCL_VERBOSE=1 MPPI_PCL_PRINT_EVERY=10 MPPI_PCL_HEARTBEAT_S=10.0 \
+MPPI_PW_ENABLE=0 MPPI_USE_POINTWORLD_COST=0 \
+PYTHONPATH=/home/wangyuhan/MPPI/src \
+python3 -m mppi.comm.ws_server_async_pcl \
+  --host 0.0.0.0 \
+  --port 9011 \
+  --open-loop-horizon 8 \
+  --policy dummy_hold \
+  --cam-id back
 ```
 
-### 1.3 单次请求（PCL client）
+1) Franka 侧先做单次 smoke（只验证协议/回包；必须双视角）
 ```bash
+PYTHONPATH=/home/wangyuhan/MPPI/src \
 python3 -m mppi.comm.ws_client_sync_pcl \
-  --url ws://127.0.0.1:9011 \
-  --rgb <rgb_path> \
-  --depth <depth_path> \
-  --cam-id back \
+  --url ws://<CLOUD_IP>:9011 \
+  --rgb-back /tmp/back.jpg \
+  --depth-back /tmp/back_depth.npy \
+  --rgb-side /tmp/side.jpg \
+  --depth-side /tmp/side_depth.npy \
+  --depth-unit-scale 1.0 \
+  --step-id 0 \
+  --request-timeout-s 10 \
   --print-actions
 ```
 
-关键约束：
-- PointWorld window 强制 `open-loop-horizon=11`（验收脚本已固化）
-- 静态 AABB 默认：`configs/pointworld_static_aabbs.json`
+2) 通信稳定后再切到 mppi_joint（并按需打开 cuRobo / PointWorld）
+- 只开 mppi_joint：`--policy mppi_joint`
+- 打开 PointWorld 时：必须 `--open-loop-horizon 11`，且 client timeout 建议 ≥120s（PointWorld 很慢）
 
 ---
 
-## 2. 目录结构与职责
+## 2. 目录结构（建议先看表）
+
+| 目录 | 作用 | 你会直接用到的入口 |
+|---|---|---|
+| `src/` | 核心 Python 包 `mppi`（通信/推理/PointWorld/curobo） | `python3 -m mppi.comm.ws_server_async_pcl`、`python3 -m mppi.comm.ws_client_sync_pcl` |
+| `tests/` | 标准回放验收与测试记录（收口 PASS/FAIL） | `tests/run_pw_replay_acceptance.sh`、`tests/pw_replay_acceptance.py` |
+| `scripts/` | 辅助脚本（启动/复现/调试） | `scripts/test_cuRobo_pcl.sh` |
+| `configs/` | 相机内参/外参、PointWorld AABB 等配置 | `configs/*_cam_info.yaml`、`configs/T_base_cam_*.yaml`、`configs/pointworld_static_aabbs.json` |
+| `data/` | 示例数据与验收落盘输出 | `data/pw_acceptance/<profile>/...` |
+| `third_party/` | 外部依赖（例如 co-tracker） | 按需安装/引用 |
 
 ### 2.1 顶层目录
 - `src/`：核心 Python 包（mppi），推理/通信/场景构建均在这里
