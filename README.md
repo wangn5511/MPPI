@@ -3,7 +3,7 @@
 本仓库提供一个面向 Franka 机械臂的 MPPI 关节空间推理服务。
 
 当前主链路收敛到 PCL 协议（schema_version=100，ws://<HOST>:9011）：
-- client 上行：双视角 back+side 的 RGB/Depth（可压缩）+ 当前关节 `q(7)` + `step_id/t_client_send_ns`
+- client 上行：双视角 back+side 的 RGB/Depth（可压缩）+ 当前关节 `q(7)` + `step_id/t_client_send_ns` + 末端目标 `goal_ee_xyz(3)`
 - server 侧：在线解码与反投影得到 base 点云；可选接入 PointWorld window/tracking 产出 `scene_flows` 等观测；用 MPPI 求解并回包 `actions(T,8)`
 
 本 README 只讲两条主线，并给出可直接复制的启动命令：
@@ -27,14 +27,15 @@ export PYTHONPATH=/home/wangyuhan/MPPI/src:$PYTHONPATH
 ```bash
 EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
 DUAL_VIEW=1 \
-bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh all obs_infl
+GOAL_EE_XYZ=0.55,0.00,0.20 \
+bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh all obs_only
 ```
 
 验收通过口径：脚本最终输出 `FINAL: PASS`，并在 `${MPPI_PW_ACCEPTANCE_DUMP_DIR}` 下产生 server 摘要 json。
 
-### 1.3 线 B：Franka↔server 通信（先 dummy_hold，再 mppi_joint）
+### 1.3 线 B：Franka↔server 通信（推荐两阶段：先 dummy_hold，再 `J_goal + J_obs`）
 
-0) 云端/本机启动 server（只测通信稳定性：dummy_hold）
+0) 云端/本机启动 server（只测通信稳定性：`dummy_hold`）
 ```bash
 cd /home/wangyuhan/MPPI
 
@@ -53,7 +54,7 @@ python3 -m mppi.comm.ws_server_async_pcl \
   --cam-id back
 ```
 
-1) Franka 侧先做单次 smoke（只验证协议/回包；必须双视角）
+1) Franka 侧先做单次协议 smoke（只验证双视角编码、`goal_ee_xyz`、回包格式）
 ```bash
 PYTHONPATH=/home/wangyuhan/MPPI/src \
 python3 -m mppi.comm.ws_client_sync_pcl \
@@ -63,14 +64,45 @@ python3 -m mppi.comm.ws_client_sync_pcl \
   --rgb-side /tmp/side.jpg \
   --depth-side /tmp/side_depth.npy \
   --depth-unit-scale 1.0 \
+  --goal-ee-xyz 0.55,0.00,0.20 \
   --step-id 0 \
   --request-timeout-s 10 \
   --print-actions
 ```
 
-2) 通信稳定后再切到 mppi_joint（并按需打开 cuRobo / PointWorld）
-- 只开 mppi_joint：`--policy mppi_joint`
-- 打开 PointWorld 时：必须 `--open-loop-horizon 11`，且 client timeout 建议 ≥120s（PointWorld 很慢）
+2) 通信稳定后切到第一阶段 `J_goal + J_obs`（`obs_only`，关闭 cuRobo 和正则项）
+```bash
+cd /home/wangyuhan/MPPI
+
+MPPI_PCL_CAM_INFO_BACK_PATH=/home/wangyuhan/MPPI/configs/back_cam_info.yaml \
+MPPI_PCL_T_BASE_CAM_BACK_PATH=/home/wangyuhan/MPPI/configs/T_base_cam_back.yaml \
+MPPI_PCL_CAM_INFO_SIDE_PATH=/home/wangyuhan/MPPI/configs/side_cam_info.yaml \
+MPPI_PCL_T_BASE_CAM_SIDE_PATH=/home/wangyuhan/MPPI/configs/T_base_cam_side.yaml \
+MPPI_PCL_VERBOSE=1 MPPI_PCL_PRINT_EVERY=10 MPPI_PCL_HEARTBEAT_S=10.0 \
+MPPI_PW_ENABLE=1 MPPI_USE_POINTWORLD_COST=1 MPPI_W_POINTWORLD=1.0 \
+MPPI_PW_COST_MODE=task_point_goal_l2 MPPI_PW_TASK_ABLATION=obs_only \
+MPPI_PW_TASK_W_OBS=1.0 MPPI_PW_AABB_CONFIG_PATH=/home/wangyuhan/MPPI/configs/pointworld_static_aabbs.json \
+MPPI_USE_CUROBO_COLLISION=0 MPPI_W_EE_POS=1.0 \
+MPPI_W_SMOOTH=0.0 MPPI_W_ACTION=0.0 MPPI_W_JOINT_LIMIT=0.0 \
+MPPI_PW_MODEL_PATH=/home/models/PointWorld/PointWorld_models/large-droid/model-best.pt \
+MPPI_PW_COTRACKER_CKPT=/home/models/Co-tracker/scaled_online.pth \
+MPPI_PW_MODEL_DEVICE=cuda:0 MPPI_PW_COTRACKER_DEVICE=cuda:0 \
+MPPI_PW_ROBOT_SAMPLER_DEVICE=cuda:0 MPPI_PW_MODEL_DOMAIN=droid \
+MPPI_URDF_PATH=/home/wangyuhan/PointWorld/assets/franka_description/franka_panda_robotiq_2f85.urdf \
+MPPI_PW_URDF_PATH=/home/wangyuhan/PointWorld/assets/franka_description/franka_panda_robotiq_2f85.urdf \
+PYTHONPATH=/home/wangyuhan/MPPI/src:/home/wangyuhan/MPPI/third_party/co-tracker:/home/wangyuhan/MPPI/third_party/curobo:/home/wangyuhan/PointWorld:/home/wangyuhan/PointWorld/third_party/dinov3 \
+python3 -m mppi.comm.ws_server_async_pcl \
+  --host 0.0.0.0 \
+  --port 9011 \
+  --open-loop-horizon 11 \
+  --policy mppi_joint \
+  --cam-id back
+```
+
+3) 第一阶段下，client/Franka 侧必须每次请求都携带 `goal_ee_xyz`
+- 旧的“只发 `q + cameras`”客户端已过时，不再满足当前 server 契约
+- 打开 PointWorld 后，client timeout 建议 ≥120s
+- 真机实时闭环时，建议用 Franka 侧 runner 替代 `ws_client_sync_pcl.py`；后者仅保留为离线 smoke 工具
 
 ---
 
@@ -183,9 +215,9 @@ python3 -m mppi.comm.ws_client_sync_pcl \
 - 回放 client：`tests/pw_replay_acceptance.py`
 
 三档 profile（同一启动方式切换）：
-- `no_pw`：不使用 task term（用于对照）
-- `obs_only`：只启用 `I_obs`
-- `obs_infl`：启用 `I_obs + I_infl`
+- `no_pw`：不使用 PointWorld cost（用于对照）
+- `obs_only`：第一阶段推荐，用于对齐 `J_goal + J_obs`
+- `obs_infl`：第三阶段再开，用于形成缓冲区（`J_infl`）
 
 ### 4.2 验收项（server 端必须稳定产出）
 - `scene_flows`
