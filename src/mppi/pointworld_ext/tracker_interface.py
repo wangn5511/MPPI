@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple, Union
+import threading
+from typing import Callable, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -19,13 +21,33 @@ class TrackWindowOutput:
     confidence: np.ndarray
 
 
+@dataclass(frozen=True)
+class TrackWindowRequest:
+    key: str
+    frames: Union[np.ndarray, Sequence[np.ndarray]]
+    query_points: np.ndarray
+
+
 class OnlinePointTracker(ABC):
     @abstractmethod
     def track_window(self, frames: Union[np.ndarray, Sequence[np.ndarray]], query_points: np.ndarray) -> TrackWindowOutput:
         raise NotImplementedError
 
+    def track_windows(self, requests: Sequence[TrackWindowRequest]) -> dict[str, TrackWindowOutput]:
+        return {
+            str(req.key): self.track_window(req.frames, req.query_points)
+            for req in tuple(requests)
+        }
+
     def update(self, frame: np.ndarray) -> None:
         raise NotImplementedError("update() is not implemented for this tracker")
+
+
+def expand_device_list(raw: Optional[str], *, fallback: str) -> tuple[str, ...]:
+    parts = [p.strip() for p in str(raw or "").split(",") if p.strip()]
+    if not parts:
+        return (str(fallback),)
+    return tuple(parts)
 
 
 def _require_torch():
@@ -81,6 +103,9 @@ class CoTrackerOnlinePointTracker(OnlinePointTracker):
         window_len: int = 16,
         device: Optional[str] = None,
         v2: bool = False,
+        iters: int = 6,
+        use_model_path: bool = True,
+        vis_thr: float = 0.6,
     ) -> None:
         torch = _require_torch()
 
@@ -108,6 +133,9 @@ class CoTrackerOnlinePointTracker(OnlinePointTracker):
         self._predictor = predictor.to(device)
         self._device = str(device)
         self._model_window_len = int(model_window_len)
+        self._iters = int(iters)
+        self._use_model_path = bool(use_model_path)
+        self._vis_thr = float(vis_thr)
 
     def track_window(self, frames: Union[np.ndarray, Sequence[np.ndarray]], query_points: np.ndarray) -> TrackWindowOutput:
         torch = self._torch
@@ -137,7 +165,7 @@ class CoTrackerOnlinePointTracker(OnlinePointTracker):
             video_rs = F.interpolate(video_rs, tuple(pred.interp_shape), mode="bilinear", align_corners=True)
             video_rs = video_rs.reshape(B, T, 3, pred.interp_shape[0], pred.interp_shape[1])
 
-            out = pred.model(video=video_rs, queries=pred.queries, iters=6, is_online=True)
+            out = pred.model(video=video_rs, queries=pred.queries, iters=int(self._iters), is_online=True)
             if len(out) >= 3:
                 tracks_t, vis_t, conf_t = out[0], out[1], out[2]
             else:
@@ -180,3 +208,137 @@ class CoTrackerOnlinePointTracker(OnlinePointTracker):
         conf = vis.astype(np.float32)
 
         return TrackWindowOutput(uv_tracks=tr, visibility=vis, confidence=conf)
+
+
+class MultiDeviceOnlinePointTracker(OnlinePointTracker):
+    def __init__(
+        self,
+        *,
+        devices: Sequence[str],
+        checkpoint: str = "",
+        window_len: int = 16,
+        v2: bool = False,
+        iters: int = 6,
+        use_model_path: bool = True,
+        vis_thr: float = 0.6,
+        tracker_factory: Optional[Callable[[str], OnlinePointTracker]] = None,
+    ) -> None:
+        devs = tuple(str(d).strip() for d in devices if str(d).strip())
+        if not devs:
+            raise ValueError("devices must be non-empty")
+
+        if tracker_factory is None:
+            if not str(checkpoint).strip():
+                raise ValueError("checkpoint is required when tracker_factory is not provided")
+
+            def tracker_factory(device: str) -> OnlinePointTracker:
+                return CoTrackerOnlinePointTracker(
+                    checkpoint=str(checkpoint),
+                    window_len=int(window_len),
+                    device=str(device),
+                    v2=bool(v2),
+                    iters=int(iters),
+                    use_model_path=bool(use_model_path),
+                    vis_thr=float(vis_thr),
+                )
+
+        self._devices = devs
+        self._trackers = tuple(tracker_factory(device) for device in self._devices)
+        self._tracker_locks = tuple(threading.Lock() for _ in self._trackers)
+        self._assignments: dict[str, int] = {}
+        self._next_index = 0
+        self._lock = threading.Lock()
+
+    @property
+    def devices(self) -> tuple[str, ...]:
+        return self._devices
+
+    @property
+    def device_assignments(self) -> dict[str, str]:
+        with self._lock:
+            return {key: self._devices[idx] for key, idx in self._assignments.items()}
+
+    def _tracker_index_for_key(self, key: str) -> int:
+        k = str(key)
+        with self._lock:
+            if k not in self._assignments:
+                self._assignments[k] = int(self._next_index % len(self._trackers))
+                self._next_index += 1
+            return int(self._assignments[k])
+
+    def track_window(self, frames: Union[np.ndarray, Sequence[np.ndarray]], query_points: np.ndarray) -> TrackWindowOutput:
+        idx = self._tracker_index_for_key("__default__")
+        return self._trackers[idx].track_window(frames, query_points)
+
+    def track_windows(self, requests: Sequence[TrackWindowRequest]) -> dict[str, TrackWindowOutput]:
+        reqs = tuple(requests)
+        if not reqs:
+            return {}
+
+        groups: dict[int, list[TrackWindowRequest]] = {}
+        for req in reqs:
+            idx = self._tracker_index_for_key(str(req.key))
+            groups.setdefault(idx, []).append(req)
+
+        def _run_group(idx: int, group: Sequence[TrackWindowRequest]) -> dict[str, TrackWindowOutput]:
+            tracker = self._trackers[int(idx)]
+            out: dict[str, TrackWindowOutput] = {}
+            with self._tracker_locks[int(idx)]:
+                for req in group:
+                    out[str(req.key)] = tracker.track_window(req.frames, req.query_points)
+            return out
+
+        if len(groups) == 1:
+            idx, group = next(iter(groups.items()))
+            return _run_group(idx, group)
+
+        merged: dict[str, TrackWindowOutput] = {}
+        with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+            futures = [pool.submit(_run_group, idx, group) for idx, group in groups.items()]
+            for fut in futures:
+                merged.update(fut.result())
+        return merged
+
+
+def build_cotracker_online_point_tracker(
+    *,
+    checkpoint: str,
+    window_len: int = 16,
+    device: Optional[str] = None,
+    v2: bool = False,
+    iters: int = 6,
+    use_model_path: bool = True,
+    vis_thr: float = 0.6,
+) -> OnlinePointTracker:
+    raw_device = str(device).strip() if device is not None else ""
+    if not raw_device:
+        return CoTrackerOnlinePointTracker(
+            checkpoint=str(checkpoint),
+            window_len=int(window_len),
+            device=None,
+            v2=bool(v2),
+            iters=int(iters),
+            use_model_path=bool(use_model_path),
+            vis_thr=float(vis_thr),
+        )
+
+    devices = expand_device_list(raw_device, fallback="cuda")
+    if len(devices) == 1:
+        return CoTrackerOnlinePointTracker(
+            checkpoint=str(checkpoint),
+            window_len=int(window_len),
+            device=devices[0],
+            v2=bool(v2),
+            iters=int(iters),
+            use_model_path=bool(use_model_path),
+            vis_thr=float(vis_thr),
+        )
+    return MultiDeviceOnlinePointTracker(
+        checkpoint=str(checkpoint),
+        window_len=int(window_len),
+        devices=devices,
+        v2=bool(v2),
+        iters=int(iters),
+        use_model_path=bool(use_model_path),
+        vis_thr=float(vis_thr),
+    )

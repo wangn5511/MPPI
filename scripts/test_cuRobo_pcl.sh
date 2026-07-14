@@ -3,23 +3,71 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
-POINTWORLD_ROOT="${POINTWORLD_ROOT:-/workspace/pointworld}"
+
+DEFAULT_POINTWORLD_ROOT="${REPO_ROOT}/../PointWorld"
+if [ ! -d "${DEFAULT_POINTWORLD_ROOT}" ] && [ -d /workspace/pointworld ]; then
+  DEFAULT_POINTWORLD_ROOT="/workspace/pointworld"
+elif [ ! -d "${DEFAULT_POINTWORLD_ROOT}" ] && [ -d /home/wangning/PointWorld ]; then
+  DEFAULT_POINTWORLD_ROOT="/home/wangning/PointWorld"
+elif [ ! -d "${DEFAULT_POINTWORLD_ROOT}" ] && [ -d /home/wangyuhan/PointWorld ]; then
+  DEFAULT_POINTWORLD_ROOT="/home/wangyuhan/PointWorld"
+fi
+POINTWORLD_ROOT="${POINTWORLD_ROOT:-${DEFAULT_POINTWORLD_ROOT}}"
 
 detect_visible_cuda_devices() {
   python3 - <<'PY'
 import subprocess
+
+count = 0
+try:
+    import torch
+
+    if torch.cuda.is_available():
+        count = int(torch.cuda.device_count())
+except Exception:
+    count = 0
+
+if count <= 0:
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            text=True,
+        )
+        lines = [line.strip() for line in out.splitlines() if line.strip()]
+        count = len(lines)
+    except Exception:
+        count = 0
+
+print(",".join(f"cuda:{i}" for i in range(count)) if count > 0 else "cpu")
+PY
+}
+
+detect_cuda_available() {
+  python3 - <<'PY'
+import os
+import subprocess
+
+visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+if visible is not None and visible.strip().lower() in ("", "-1", "none", "null", "void"):
+    print("0")
+    raise SystemExit(0)
+
+try:
+    import torch
+
+    print("1" if torch.cuda.is_available() and int(torch.cuda.device_count()) > 0 else "0")
+    raise SystemExit(0)
+except Exception:
+    pass
 
 try:
     out = subprocess.check_output(
         ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
         text=True,
     )
-    lines = [line.strip() for line in out.splitlines() if line.strip()]
-    count = max(1, len(lines))
+    print("1" if any(line.strip() for line in out.splitlines()) else "0")
 except Exception:
-    count = 1
-
-print(",".join(f"cuda:{i}" for i in range(count)))
+    print("0")
 PY
 }
 
@@ -28,11 +76,30 @@ if [ -d "${POINTWORLD_ROOT}" ]; then
   export PYTHONPATH="${POINTWORLD_ROOT}:${PYTHONPATH}"
 fi
 
-export MPPI_URDF_PATH="${MPPI_URDF_PATH:-/workspace/pointworld/assets/franka_description/franka_panda_robotiq_2f85.urdf}"
+CUDA_AVAILABLE="$(detect_cuda_available)"
 
-export MPPI_USE_CUROBO_COLLISION="${MPPI_USE_CUROBO_COLLISION:-1}"
+export MPPI_URDF_PATH="${MPPI_URDF_PATH:-/workspace/pointworld/assets/franka_description/franka_panda_robotiq_2f85.urdf}"
+CUROBO_DEFAULT_DEVICE="cpu"
+if [ "${CUDA_AVAILABLE}" = "1" ]; then
+  CUROBO_DEFAULT_DEVICE="$(detect_visible_cuda_devices)"
+fi
+export MPPI_CUROBO_DEVICE="${MPPI_CUROBO_DEVICE:-${CUROBO_DEFAULT_DEVICE}}"
+
+if [ "${CUDA_AVAILABLE}" = "1" ]; then
+  export MPPI_USE_CUROBO_COLLISION="${MPPI_USE_CUROBO_COLLISION:-1}"
+  export MPPI_SCENE_FROM_PCD_BACK_CAM="${MPPI_SCENE_FROM_PCD_BACK_CAM:-1}"
+else
+  echo "[mppi] CUDA not detected; using CPU-only inference defaults." >&2
+  export MPPI_USE_CUROBO_COLLISION="${MPPI_USE_CUROBO_COLLISION:-0}"
+  export MPPI_SCENE_FROM_PCD_BACK_CAM="${MPPI_SCENE_FROM_PCD_BACK_CAM:-0}"
+  export MPPI_NUM_SAMPLES="${MPPI_NUM_SAMPLES:-${MPPI_CPU_NUM_SAMPLES:-32}}"
+  if [ "${MPPI_ALLOW_CPU_POINTWORLD:-0}" != "1" ]; then
+    export MPPI_PW_ENABLE=0
+    export MPPI_USE_POINTWORLD_COST=0
+  fi
+fi
+
 export MPPI_W_SCENE_COLLISION="${MPPI_W_SCENE_COLLISION:-1}"
-export MPPI_SCENE_FROM_PCD_BACK_CAM="${MPPI_SCENE_FROM_PCD_BACK_CAM:-1}"
 
 export MPPI_SCENE_PCD_SCALE="${MPPI_SCENE_PCD_SCALE:-1}"
 export MPPI_SCENE_PCD_IN_BASE="${MPPI_SCENE_PCD_IN_BASE:-1}"
@@ -84,12 +151,17 @@ export MPPI_PW_ENABLE="${MPPI_PW_ENABLE:-0}"
 export MPPI_USE_POINTWORLD_COST="${MPPI_USE_POINTWORLD_COST:-0}"
 export MPPI_W_POINTWORLD="${MPPI_W_POINTWORLD:-1.0}"
 export MPPI_PW_DISABLE_COMPILE="${MPPI_PW_DISABLE_COMPILE:-1}"
-export MPPI_PW_MODEL_DEVICE="${MPPI_PW_MODEL_DEVICE:-cuda}"
-export MPPI_PW_COTRACKER_DEVICE="${MPPI_PW_COTRACKER_DEVICE:-cuda}"
+PW_DEFAULT_DEVICE="cuda"
+if [ "${CUDA_AVAILABLE}" != "1" ] && [ "${MPPI_ALLOW_CPU_POINTWORLD:-0}" = "1" ]; then
+  PW_DEFAULT_DEVICE="cpu"
+fi
+export MPPI_PW_MODEL_DEVICE="${MPPI_PW_MODEL_DEVICE:-${PW_DEFAULT_DEVICE}}"
+export MPPI_PW_COTRACKER_DEVICE="${MPPI_PW_COTRACKER_DEVICE:-${PW_DEFAULT_DEVICE}}"
 export MPPI_PW_MODEL_PATH="${MPPI_PW_MODEL_PATH:-/home/models/PointWorld/PointWorld_models/large-droid/model-best.pt}"
 export MPPI_PW_COTRACKER_CKPT="${MPPI_PW_COTRACKER_CKPT:-/home/models/Co-tracker/scaled_online.pth}"
 export MPPI_PW_MODEL_DOMAIN="${MPPI_PW_MODEL_DOMAIN:-droid}"
 export MPPI_PW_ALLOW_RAW_SCENE_FALLBACK="${MPPI_PW_ALLOW_RAW_SCENE_FALLBACK:-0}"
+export MPPI_PW_DIST2ROBOT_MODE="${MPPI_PW_DIST2ROBOT_MODE:-t0_repeat}"
 
 OPEN_LOOP_HORIZON="${MPPI_OPEN_LOOP_HORIZON:-8}"
 if [ "${MPPI_PW_ENABLE}" = "1" ] || [ "${MPPI_USE_POINTWORLD_COST}" = "1" ]; then
@@ -99,6 +171,9 @@ fi
 if [ "${MPPI_PW_ENABLE}" = "1" ] || [ "${MPPI_USE_POINTWORLD_COST}" = "1" ]; then
   if [ "${MPPI_PW_MODEL_DEVICE:-cuda}" = "cuda" ]; then
     export MPPI_PW_MODEL_DEVICE="$(detect_visible_cuda_devices)"
+  fi
+  if [ "${MPPI_PW_COTRACKER_DEVICE:-cuda}" = "cuda" ]; then
+    export MPPI_PW_COTRACKER_DEVICE="$(detect_visible_cuda_devices)"
   fi
   export MPPI_PW_ROBOT_SAMPLER_DEVICE="${MPPI_PW_ROBOT_SAMPLER_DEVICE:-${MPPI_PW_MODEL_DEVICE}}"
   if [ -z "${MPPI_INFER_BUDGET_MS_WAS_SET}" ]; then

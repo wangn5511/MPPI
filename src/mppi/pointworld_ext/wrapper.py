@@ -18,6 +18,7 @@ from mppi.pointworld_ext.flows import (
     RobotFlowAdapter,
     build_robot_inputs,
     build_scene_features_torch,
+    normalize_dist2robot_mode,
     prepare_scene_inputs,
 )
 from mppi.utils.paths import default_pointworld_root, default_urdf_path, ensure_sys_path_for_runtime
@@ -43,6 +44,7 @@ class PointWorldModelConfig:
     seed: int = 1
     disable_compile: bool = True
     eval_batch_size: int = 32
+    dist2robot_mode: str = "full"
     cost: PointWorldCostConfig = field(default_factory=PointWorldCostConfig)
 
 
@@ -55,6 +57,7 @@ class PointWorldCostModel:
         self._domain = str(cfg.domain or self._data_contract["domains"][0])
         self._devices = self._expand_device_list(str(cfg.device), fallback="cuda")
         self._robot_devices = self._resolve_robot_devices()
+        self._dist2robot_mode = normalize_dist2robot_mode(cfg.dist2robot_mode)
 
         self.max_scene_points = int(
             cfg.max_scene_points
@@ -71,6 +74,7 @@ class PointWorldCostModel:
             self._build_replica(device=model_device, robot_device=robot_device)
             for model_device, robot_device in zip(self._devices, self._robot_devices)
         ]
+        self.last_eval_ranges: tuple[dict[str, Any], ...] = ()
 
     def __call__(
         self,
@@ -325,6 +329,34 @@ class PointWorldCostModel:
             batch_size=1,
             max_scene_points=int(self.max_scene_points),
         )
+
+        Ns = int(scene["scene_flows"].shape[2])
+
+        def _filter_task(idx_key: str, goal_key: str, w_key: Optional[str], w_default: float) -> None:
+            idx = np.asarray(pointworld_obs[idx_key], dtype=np.int64).reshape(-1)
+            goal = np.asarray(pointworld_obs[goal_key], dtype=np.float32)
+
+            if goal.ndim >= 1 and int(goal.shape[0]) == int(idx.shape[0]):
+                keep = (idx >= 0) & (idx < Ns)
+                idx = idx[keep]
+                goal = goal[keep]
+            else:
+                idx = idx[(idx >= 0) & (idx < Ns)]
+
+            scene[idx_key] = idx
+            scene[goal_key] = goal
+            if w_key is not None:
+                scene[w_key] = float(pointworld_obs.get(w_key, w_default))
+
+        if "task_point_indices_obs" in pointworld_obs and "task_goal_positions_obs" in pointworld_obs:
+            _filter_task("task_point_indices_obs", "task_goal_positions_obs", "task_weight_obs", 1.0)
+
+        if "task_point_indices_infl" in pointworld_obs and "task_goal_positions_infl" in pointworld_obs:
+            _filter_task("task_point_indices_infl", "task_goal_positions_infl", "task_weight_infl", 0.5)
+
+        if "task_point_indices" in pointworld_obs and "task_goal_positions" in pointworld_obs:
+            _filter_task("task_point_indices", "task_goal_positions", None, 1.0)
+
         if int(scene["scene_flows"].shape[1]) != int(T):
             raise ValueError(
                 f"PointWorld scene window T={int(scene['scene_flows'].shape[1])} must match q_traj horizon T={int(T)}"
@@ -359,12 +391,15 @@ class PointWorldCostModel:
 
     def _numpy_batch_to_torch(self, batch: dict[str, Any], *, device: str) -> dict[str, Any]:
         torch = self._torch
-        device_t = torch.device(str(device))
+        device_s = str(device).split(",")[0].strip()
+        device_t = torch.device(device_s)
         out: dict[str, Any] = {}
         for key, value in batch.items():
             if isinstance(value, np.ndarray):
                 if value.dtype == np.bool_:
                     out[key] = torch.as_tensor(value, device=device_t, dtype=torch.bool)
+                elif np.issubdtype(value.dtype, np.integer):
+                    out[key] = torch.as_tensor(value, device=device_t, dtype=torch.long)
                 else:
                     out[key] = torch.as_tensor(value, device=device_t, dtype=torch.float32)
             else:
@@ -373,13 +408,20 @@ class PointWorldCostModel:
 
     def _slice_batch(self, batch: dict[str, Any], start: int, end: int) -> dict[str, Any]:
         out: dict[str, Any] = {}
+
+        B = None
+        if "robot_flows" in batch and isinstance(batch["robot_flows"], np.ndarray) and batch["robot_flows"].ndim >= 1:
+            B = int(batch["robot_flows"].shape[0])
+
         for key, value in batch.items():
-            if isinstance(value, np.ndarray) and value.ndim >= 1 and int(value.shape[0]) == int(batch["scene_flows"].shape[0]):
-                out[key] = value[start:end]
-            elif isinstance(value, list) and len(value) == int(batch["scene_flows"].shape[0]):
-                out[key] = value[start:end]
-            else:
-                out[key] = value
+            if B is not None:
+                if isinstance(value, np.ndarray) and value.ndim >= 1 and int(value.shape[0]) == B:
+                    out[key] = value[start:end]
+                    continue
+                if isinstance(value, list) and len(value) == B:
+                    out[key] = value[start:end]
+                    continue
+            out[key] = value
         return out
 
     def _evaluate_batch_on_replica(
@@ -394,8 +436,10 @@ class PointWorldCostModel:
         costs: list[np.ndarray] = []
         torch = self._torch
 
-        if replica.device.startswith("cuda"):
-            torch.cuda.set_device(torch.device(replica.device))
+        device_s = str(replica.device).split(",")[0].strip()
+        device_t = torch.device(device_s)
+        if device_t.type == "cuda":
+            torch.cuda.set_device(device_t.index if device_t.index is not None else 0)
 
         scene_t = self._numpy_batch_to_torch(scene_np, device=replica.device)
 
@@ -412,6 +456,9 @@ class PointWorldCostModel:
                 scene_flows=scene_flows_t,
                 scene_colors=scene_colors_t,
                 gripper_positions=robot_t["gripper_positions"],
+                robot_flows=robot_t["robot_flows"],
+                robot_exists=robot_t["robot_exists"],
+                dist2robot_mode=self._dist2robot_mode,
             )
             batch_t = {
                 "scene_flows": scene_flows_t,
@@ -436,15 +483,45 @@ class PointWorldCostModel:
             if "scene_track_confidence" in scene_t:
                 track_conf_t = scene_t["scene_track_confidence"].expand(chunk_b, -1, -1)
 
-            costs.append(
-                reduce_pointworld_cost_torch(
-                    scene_relative=outputs["scene_relative"],
-                    scene_exists=batch_t["scene_exists"],
-                    model_confidence=model_conf,
-                    track_confidence=track_conf_t,
-                    cfg=self.cfg.cost,
-                ).detach().cpu().numpy().astype(np.float32)
-            )
+            mode = str(self.cfg.cost.mode)
+            task_mode = mode in {"task_point_goal_l2", "final_task_point_goal_l2"}
+
+            terms = []
+            if "task_point_indices_obs" in scene_t and "task_goal_positions_obs" in scene_t:
+                terms.append((scene_t.get("task_point_indices_obs"), scene_t.get("task_goal_positions_obs"), float(scene_t.get("task_weight_obs", 1.0))))
+            if "task_point_indices_infl" in scene_t and "task_goal_positions_infl" in scene_t:
+                terms.append((scene_t.get("task_point_indices_infl"), scene_t.get("task_goal_positions_infl"), float(scene_t.get("task_weight_infl", 0.5))))
+            if "task_point_indices" in scene_t and "task_goal_positions" in scene_t:
+                terms.append((scene_t.get("task_point_indices"), scene_t.get("task_goal_positions"), 1.0))
+
+            if terms:
+                total = torch.zeros((chunk_b,), device=replica.device, dtype=torch.float32)
+                for idx_term, goal_term, w_term in terms:
+                    if float(w_term) == 0.0:
+                        continue
+                    total = total + float(w_term) * reduce_pointworld_cost_torch(
+                        scene_relative=outputs["scene_relative"],
+                        scene_exists=batch_t["scene_exists"],
+                        model_confidence=model_conf,
+                        track_confidence=track_conf_t,
+                        scene_p0=scene_flows_t[:, 0],
+                        task_point_indices=idx_term,
+                        task_goal_positions=goal_term,
+                        cfg=self.cfg.cost,
+                    )
+                costs.append(total.detach().cpu().numpy().astype(np.float32))
+            elif task_mode:
+                costs.append(torch.zeros((chunk_b,), device=replica.device, dtype=torch.float32).detach().cpu().numpy().astype(np.float32))
+            else:
+                costs.append(
+                    reduce_pointworld_cost_torch(
+                        scene_relative=outputs["scene_relative"],
+                        scene_exists=batch_t["scene_exists"],
+                        model_confidence=model_conf,
+                        track_confidence=track_conf_t,
+                        cfg=self.cfg.cost,
+                    ).detach().cpu().numpy().astype(np.float32)
+                )
 
         return np.concatenate(costs, axis=0).astype(np.float32, copy=False)
 
@@ -491,9 +568,18 @@ class PointWorldCostModel:
             raise ValueError(f"q_traj must be (B,T,7), got {q.shape}")
         B = int(q.shape[0])
         if B == 0:
+            self.last_eval_ranges = ()
             return np.zeros((0,), dtype=np.float32)
 
         if len(self._replicas) == 1:
+            self.last_eval_ranges = (
+                {
+                    "device": str(self._replicas[0].device),
+                    "start": 0,
+                    "end": B,
+                    "samples": B,
+                },
+            )
             return self._evaluate_cost_on_replica(
                 replica=self._replicas[0],
                 q_traj=q,
@@ -502,6 +588,15 @@ class PointWorldCostModel:
             )
 
         ranges = self._make_ranges(B, len(self._replicas))
+        self.last_eval_ranges = tuple(
+            {
+                "device": str(self._replicas[idx].device),
+                "start": int(start),
+                "end": int(end),
+                "samples": int(end - start),
+            }
+            for idx, (start, end) in enumerate(ranges)
+        )
         costs = np.zeros((B,), dtype=np.float32)
 
         def _worker(replica: _PointWorldReplica, start: int, end: int) -> tuple[int, int, np.ndarray]:

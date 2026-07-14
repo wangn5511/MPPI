@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol
 
@@ -22,6 +23,106 @@ class PointWorldCostFn(Protocol):
         gripper: Optional[float],
     ) -> np.ndarray: ...
 
+
+def _expand_device_list(raw: object, *, fallback: str) -> tuple[str, ...]:
+    parts = [p.strip() for p in str(raw or "").split(",") if p.strip()]
+    if not parts:
+        return (str(fallback),)
+    return tuple(parts)
+
+
+def _first_device(raw: object, *, fallback: str = "cuda:0") -> str:
+    return _expand_device_list(raw, fallback=fallback)[0]
+
+
+def _make_sample_ranges(total: int, parts: int) -> list[tuple[int, int]]:
+    if int(total) <= 0 or int(parts) <= 0:
+        return []
+    n_parts = min(int(total), int(parts))
+    base = int(total) // n_parts
+    rem = int(total) % n_parts
+    out: list[tuple[int, int]] = []
+    start = 0
+    for idx in range(n_parts):
+        width = base + (1 if idx < rem else 0)
+        end = start + width
+        out.append((start, end))
+        start = end
+    return out
+
+
+def _curobo_cfg_for_device(cfg: "JointMPPIConfig", device: str) -> CuRoboCollisionConfig:
+    return CuRoboCollisionConfig(
+        device=str(device),
+        robot_yaml=str(cfg.curobo_robot_yaml),
+        urdf_path=str(cfg.urdf_path),
+        tool_frame=str(cfg.curobo_tool_frame),
+        with_world=bool(cfg.curobo_with_world),
+        collision_activation_distance=float(cfg.curobo_collision_activation_distance),
+        self_collision_activation_distance=float(cfg.curobo_self_collision_activation_distance),
+        max_collision_distance=float(cfg.curobo_max_collision_distance),
+    )
+
+
+def _curobo_batch_distance(
+    cfg: "JointMPPIConfig",
+    q_traj: np.ndarray,
+    *,
+    scene_cuboids: Optional[list[dict[str, Any]]] = None,
+) -> tuple[np.ndarray, np.ndarray, tuple[dict[str, Any], ...]]:
+    q = np.asarray(q_traj, dtype=np.float32)
+    if q.ndim != 3 or q.shape[-1] != 7:
+        raise ValueError(f"Expected q_traj shape (B,H,7), got {q.shape}")
+
+    B = int(q.shape[0])
+    if B == 0:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0,), dtype=np.float32), ()
+
+    devices = _expand_device_list(cfg.curobo_device, fallback="cuda:0")
+    ranges = _make_sample_ranges(B, len(devices))
+    eval_ranges = tuple(
+        {
+            "device": str(devices[idx]),
+            "start": int(start),
+            "end": int(end),
+            "samples": int(end - start),
+        }
+        for idx, (start, end) in enumerate(ranges)
+    )
+
+    if len(ranges) == 1:
+        checker = get_curobo_collision_checker(_curobo_cfg_for_device(cfg, devices[0]))
+        d_scene, d_self = checker.batch_distance(q, scene_cuboids=scene_cuboids)
+        return d_scene, d_self, eval_ranges
+
+    # cuRobo may compile/load CUDA kernels when a scene checker is first built.
+    # Warm checkers sequentially so multi-GPU worker threads only run evaluation.
+    for device in devices[: len(ranges)]:
+        checker = get_curobo_collision_checker(_curobo_cfg_for_device(cfg, device))
+        warm_checker = getattr(checker, "_get_checker", None)
+        if callable(warm_checker):
+            warm_checker(scene_cuboids)
+
+    def _worker(idx: int, start: int, end: int) -> tuple[int, int, np.ndarray, np.ndarray]:
+        checker = get_curobo_collision_checker(_curobo_cfg_for_device(cfg, devices[idx]))
+        d_scene, d_self = checker.batch_distance(q[start:end], scene_cuboids=scene_cuboids)
+        return int(start), int(end), d_scene, d_self
+
+    results: list[tuple[int, int, np.ndarray, np.ndarray]] = []
+    with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+        futures = [
+            pool.submit(_worker, idx, start, end)
+            for idx, (start, end) in enumerate(ranges)
+        ]
+        for fut in futures:
+            results.append(fut.result())
+
+    results.sort(key=lambda item: item[0])
+    d_scene = np.concatenate([item[2] for item in results], axis=0).astype(np.float32, copy=False)
+    d_self = np.concatenate([item[3] for item in results], axis=0).astype(np.float32, copy=False)
+    return d_scene, d_self, eval_ranges
+
+
 def _curobo_collision_cost(
     cfg: "JointMPPIConfig",
     q_traj: np.ndarray,
@@ -31,24 +132,14 @@ def _curobo_collision_cost(
     if not bool(cfg.use_curobo_collision):
         return np.zeros((q_traj.shape[0],), dtype=np.float32)
 
-    ccfg = CuRoboCollisionConfig(
-        device=str(cfg.curobo_device),
-        robot_yaml=str(cfg.curobo_robot_yaml),
-        urdf_path=str(cfg.urdf_path),
-        tool_frame=str(cfg.curobo_tool_frame),
-        with_world=bool(cfg.curobo_with_world),
-        collision_activation_distance=float(cfg.curobo_collision_activation_distance),
-        self_collision_activation_distance=float(cfg.curobo_self_collision_activation_distance),
-        max_collision_distance=float(cfg.curobo_max_collision_distance),
-    )
-    checker = get_curobo_collision_checker(ccfg)
     q = np.asarray(q_traj, dtype=np.float32)
-    return checker.collision_penalty(
+    d_scene, d_self, _ranges = _curobo_batch_distance(
+        cfg,
         q,
-        w_scene=float(cfg.w_scene_collision),
-        w_self=float(cfg.w_self_collision),
         scene_cuboids=scene_cuboids,
     )
+    c = float(cfg.w_scene_collision) * np.sum(d_scene, axis=(1, 2)) + float(cfg.w_self_collision) * np.sum(d_self, axis=(1, 2))
+    return c.astype(np.float32)
 
 
 def _extract_points_from_pcd(pcd_back_cam: object) -> object:
@@ -319,6 +410,7 @@ class JointMPPISolver:
         self.last_pw_enabled: bool = False
         self.last_pw_reason: str = ""
         self.last_pw_ms: float = 0.0
+        self.last_curobo_eval_ranges: tuple[dict[str, Any], ...] = ()
 
         self._fk: FrankaFK | None = None
         self._fk_link7: FrankaFK | None = None
@@ -390,6 +482,7 @@ class JointMPPISolver:
         dmin_self = float("nan")
         pw_ms = 0.0
         pw_reason = "disabled"
+        curobo_eval_ranges: tuple[dict[str, Any], ...] = ()
 
         need_dist = bool(self.cfg.use_curobo_collision) and (
             float(self.cfg.w_scene_collision) > 0.0
@@ -397,19 +490,12 @@ class JointMPPISolver:
             or bool(self.cfg.debug_cost_stats)
         )
         if need_dist:
-            ccfg = CuRoboCollisionConfig(
-                device=str(self.cfg.curobo_device),
-                robot_yaml=str(self.cfg.curobo_robot_yaml),
-                urdf_path=str(self.cfg.urdf_path),
-                tool_frame=str(self.cfg.curobo_tool_frame),
-                with_world=bool(self.cfg.curobo_with_world),
-                collision_activation_distance=float(self.cfg.curobo_collision_activation_distance),
-                self_collision_activation_distance=float(self.cfg.curobo_self_collision_activation_distance),
-                max_collision_distance=float(self.cfg.curobo_max_collision_distance),
-            )
-            checker = get_curobo_collision_checker(ccfg)
             q_h = np.asarray(q_traj[:, 1:, :], dtype=np.float32)
-            d_scene, d_self = checker.batch_distance(q_h, scene_cuboids=scene_cuboids)
+            d_scene, d_self, curobo_eval_ranges = _curobo_batch_distance(
+                self.cfg,
+                q_h,
+                scene_cuboids=scene_cuboids,
+            )
             if d_scene.size > 0:
                 dmin_scene = float(np.min(d_scene))
                 axes = tuple(range(1, int(d_scene.ndim)))
@@ -464,6 +550,7 @@ class JointMPPISolver:
             "min_distance_self": dmin_self,
             "pointworld_ms": pw_ms,
             "pointworld_reason": pw_reason,
+            "curobo_eval_ranges": curobo_eval_ranges,
         }
         return total, extra
 
@@ -495,6 +582,7 @@ class JointMPPISolver:
         self.last_pw_enabled = False
         self.last_pw_reason = ""
         self.last_pw_ms = 0.0
+        self.last_curobo_eval_ranges = ()
 
         t_infer0 = __import__("time").perf_counter()
 
@@ -545,7 +633,7 @@ class JointMPPISolver:
                     else:
                         checker = get_curobo_collision_checker(
                             CuRoboCollisionConfig(
-                                device=str(cfg.curobo_device),
+                                device=_first_device(cfg.curobo_device),
                                 robot_yaml=str(cfg.curobo_robot_yaml),
                                 urdf_path=str(cfg.urdf_path),
                                 tool_frame=str(cfg.curobo_tool_frame),
@@ -677,6 +765,8 @@ class JointMPPISolver:
             self.last_pw_ms = float(extra.get("pointworld_ms", 0.0))
             self.last_pw_reason = str(extra.get("pointworld_reason", ""))
             self.last_pw_enabled = self.last_pw_reason == "ok"
+            ranges = extra.get("curobo_eval_ranges", ())
+            self.last_curobo_eval_ranges = tuple(dict(x) for x in tuple(ranges)) if ranges else ()
             if bool(cfg.debug_cost_stats):
                 q = float(cfg.debug_cost_stats_q)
                 if not (0.0 <= q <= 1.0):

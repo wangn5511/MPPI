@@ -87,6 +87,10 @@ def _fk_T_base_link(urdf_path: str, q7: np.ndarray, link_name: str) -> np.ndarra
     return T[0].detach().cpu().numpy().astype(np.float32)
 
 
+def fk_T_base_link(*, urdf_path: str, q7: np.ndarray, link_name: str) -> np.ndarray:
+    return _fk_T_base_link(str(urdf_path), np.asarray(q7, dtype=np.float32).reshape(7), str(link_name))
+
+
 def _require_curobo_v2():
     ensure_sys_path_for_runtime()
     try:
@@ -236,6 +240,12 @@ class CuRoboCollisionChecker:
         self._checker_cache: dict[str, Any] = {}
         self._torch = None
 
+    def _set_device_context(self) -> None:
+        torch = _require_torch()
+        device = torch.device(str(self.cfg.device))
+        if device.type == "cuda":
+            torch.cuda.set_device(device.index if device.index is not None else 0)
+
     def _make_scene_cfg(self, scene_cuboids: Optional[list[dict[str, Any]]]) -> Optional[Dict[str, Any]]:
         if not bool(self.cfg.with_world):
             return None
@@ -274,6 +284,7 @@ class CuRoboCollisionChecker:
         return "__".join(parts) if parts else "__default__"
 
     def _get_checker(self, scene_cuboids: Optional[list[dict[str, Any]]] = None):
+        self._set_device_context()
         key = self._scene_key(scene_cuboids)
         cached = self._checker_cache.get(key)
         if cached is not None:
@@ -321,6 +332,7 @@ class CuRoboCollisionChecker:
         *,
         scene_cuboids: Optional[list[dict[str, Any]]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
+        self._set_device_context()
         checker = self._get_checker(scene_cuboids)
         torch = self._torch
 
@@ -354,6 +366,7 @@ class CuRoboCollisionChecker:
         return c.astype(np.float32)
 
     def robot_spheres(self, q: np.ndarray) -> np.ndarray:
+        self._set_device_context()
         checker = self._get_checker(None)
         torch = self._torch
 

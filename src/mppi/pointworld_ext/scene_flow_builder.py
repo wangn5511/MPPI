@@ -12,11 +12,12 @@ from mppi.pointworld_ext.geometry import (
     compute_workspace_mask_2d,
     invert_T,
     lift_tracked_pixels_to_3d,
+    project_points_to_pixels,
     transform_points,
 )
 from mppi.pointworld_ext.input_config import PointWorldInputConfig
 from mppi.pointworld_ext.query_manager import QueryPointManager
-from mppi.pointworld_ext.tracker_interface import OnlinePointTracker
+from mppi.pointworld_ext.tracker_interface import OnlinePointTracker, TrackWindowRequest
 from mppi.pointworld_ext.window_buffer import PointWorldWindowBuffer
 
 
@@ -25,6 +26,8 @@ class SceneFlowBuildOutput:
     scene_flows: np.ndarray
     scene_colors: np.ndarray
     scene_exists: np.ndarray
+    scene_visibility: np.ndarray
+    scene_depth_valid_mask: np.ndarray
     scene_track_confidence: np.ndarray
     camera_track_slices: Tuple[Tuple[int, int], ...]
     camera_track_ids: np.ndarray
@@ -68,7 +71,23 @@ def _require_cv2():
     return cv2
 
 
+def _ensure_numpy_legacy_aliases() -> None:
+    # urdfpy versions commonly bundled with robot stacks still reference
+    # NumPy aliases removed in NumPy 1.24.
+    for name, value in {
+        "bool": bool,
+        "complex": complex,
+        "float": float,
+        "int": int,
+        "object": object,
+        "str": str,
+    }.items():
+        if name not in np.__dict__:
+            setattr(np, name, value)
+
+
 def _require_trimesh_urdfpy():
+    _ensure_numpy_legacy_aliases()
     try:
         import trimesh  # noqa: F401
         import urdfpy  # noqa: F401
@@ -110,6 +129,7 @@ def _get_mesh_stable_id(mesh: object, idx: int | None = None) -> str:
 class _URDFHelper:
     def __init__(self, *, urdf_path: str) -> None:
         _require_trimesh_urdfpy()
+        _ensure_numpy_legacy_aliases()
         import urdfpy
 
         self._urdf = urdfpy.URDF.load(str(urdf_path))
@@ -258,8 +278,19 @@ class _RobotMask2DBuilder:
         H = int(height)
         W = int(width)
         robot_mask = np.zeros((H, W), dtype=np.uint8)
-        standard_circle_radius = 30
-        gripper_circle_radius = 20
+
+        ref_H, ref_W = 180.0, 320.0
+        scale = min(float(H) / ref_H, float(W) / ref_W)
+        if not np.isfinite(scale) or scale <= 0.0:
+            scale = 1.0
+
+        standard_circle_radius = max(1, int(round(30.0 * scale)))
+        gripper_circle_radius = max(1, int(round(20.0 * scale)))
+
+        kernel_size = max(3, int(round(30.0 * scale)))
+        if (kernel_size % 2) == 0:
+            kernel_size += 1
+
         gripper_keywords = ["finger", "knuckle", "robotiq"]
 
         for i, mesh in enumerate(fk_result.keys()):
@@ -284,7 +315,7 @@ class _RobotMask2DBuilder:
                 if 0 <= x < W and 0 <= y < H:
                     cv2.circle(robot_mask, (int(x), int(y)), int(circle_radius), color=1, thickness=-1)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (30, 30))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(kernel_size), int(kernel_size)))
         robot_mask = cv2.morphologyEx(robot_mask, cv2.MORPH_CLOSE, kernel)
         return robot_mask.astype(bool)
 
@@ -339,8 +370,12 @@ class OnlineSceneFlowBuilder:
 
         per_cam_xyz: Dict[str, np.ndarray] = {}
         per_cam_exists: Dict[str, np.ndarray] = {}
+        per_cam_visibility: Dict[str, np.ndarray] = {}
+        per_cam_depth_valid: Dict[str, np.ndarray] = {}
         per_cam_conf: Dict[str, np.ndarray] = {}
         per_cam_cols: Dict[str, np.ndarray] = {}
+        per_cam_prepared: Dict[str, dict[str, np.ndarray | list[np.ndarray]]] = {}
+        track_requests: list[TrackWindowRequest] = []
 
         ee_spheres_link = _as_spheres_array(self.cfg.robot_filter.ee_filter_spheres)
 
@@ -398,7 +433,22 @@ class OnlineSceneFlowBuilder:
 
             cols0 = _sample_rgb_at_uv(rgb0, q0)
 
-            track_out = self.tracker.track_window(frames, q0)
+            per_cam_prepared[cam_name] = {
+                "q0": q0,
+                "cols0": cols0,
+            }
+            track_requests.append(TrackWindowRequest(key=str(cam_name), frames=frames, query_points=q0))
+
+        track_outputs = self.tracker.track_windows(tuple(track_requests))
+
+        for cam_name in cameras_used:
+            prepared = per_cam_prepared[str(cam_name)]
+            q0 = np.asarray(prepared["q0"], dtype=np.float32)
+            cols0 = np.asarray(prepared["cols0"], dtype=np.uint8)
+
+            if str(cam_name) not in track_outputs:
+                raise RuntimeError(f"Tracker did not return output for camera '{cam_name}'")
+            track_out = track_outputs[str(cam_name)]
 
             uv_tracks = np.asarray(track_out.uv_tracks, dtype=np.float32)
             visibility = np.asarray(track_out.visibility).astype(bool)
@@ -413,6 +463,8 @@ class OnlineSceneFlowBuilder:
 
             xyz_base = np.zeros((T, q0.shape[0], 3), dtype=np.float32)
             exists = np.zeros((T, q0.shape[0]), dtype=bool)
+            vis_out = np.zeros((T, q0.shape[0]), dtype=bool)
+            depth_valid_out = np.zeros((T, q0.shape[0]), dtype=bool)
             conf_out = np.zeros((T, q0.shape[0]), dtype=np.float32)
             ws_ok = np.zeros((T, q0.shape[0]), dtype=bool)
 
@@ -421,7 +473,13 @@ class OnlineSceneFlowBuilder:
                 intr: PinholeIntrinsics = cam.intrinsics
                 depth_t = cam.depth
 
-                xyz_cam, z_ok = lift_tracked_pixels_to_3d(depth_t, uv_tracks[t], intr=intr)
+                xyz_cam, z_ok = lift_tracked_pixels_to_3d(
+                    depth_t,
+                    uv_tracks[t],
+                    intr=intr,
+                    depth_min_m=float(self.cfg.tracking.depth_min_m),
+                    depth_max_m=float(self.cfg.tracking.depth_max_m),
+                )
                 xyzb = transform_points(cam.extrinsics, xyz_cam.reshape(-1, 3)).reshape(q0.shape[0], 3)
 
                 keep_ws = apply_workspace_mask_to_points(
@@ -429,7 +487,7 @@ class OnlineSceneFlowBuilder:
                     workspace_min=self.cfg.workspace_filter.workspace_min,
                     workspace_max=self.cfg.workspace_filter.workspace_max,
                 )
-                ws_ok[t] = keep_ws
+                ws_ok[t] = keep_ws & z_ok
 
                 if robot_spheres_base is None:
                     keep_robot = np.ones((q0.shape[0],), dtype=bool)
@@ -468,6 +526,8 @@ class OnlineSceneFlowBuilder:
                     & (confidence[t] >= float(self.cfg.tracking.min_track_confidence))
                 )
 
+                vis_out[t] = visibility[t]
+                depth_valid_out[t] = z_ok
                 xyz_base[t] = np.where(ok[:, None], xyzb, np.zeros_like(xyzb))
                 exists[t] = ok
                 conf_out[t] = np.where(ok, confidence[t], 0.0).astype(np.float32)
@@ -483,6 +543,15 @@ class OnlineSceneFlowBuilder:
             run_thr = int(self.cfg.workspace_filter.stability_ws_run_len_thresh)
             stable = (r_ws >= thr) & (mx >= run_thr)
 
+            strict_enabled = bool(getattr(self.cfg.workspace_filter, "strict_all_time_enabled", False))
+            strict_all = np.all(ws_ok, axis=0) if ws_ok.size else np.zeros((q0.shape[0],), dtype=bool)
+
+            if strict_enabled:
+                exists2 = exists & strict_all[None, :]
+                xyz_base = np.where(exists2[..., None], xyz_base, np.zeros_like(xyz_base))
+                conf_out = np.where(exists2, conf_out, 0.0).astype(np.float32)
+                exists = exists2
+
             if bool(self.cfg.workspace_filter.stability_apply_to_confidence):
                 conf_out = (conf_out * r_ws[None, :]).astype(np.float32)
 
@@ -492,8 +561,12 @@ class OnlineSceneFlowBuilder:
                 conf_out = np.where(exists2, conf_out, 0.0).astype(np.float32)
                 exists = exists2
 
+            stable_mask0 = (stable & strict_all) if strict_enabled else stable
+
             per_cam_xyz[cam_name] = xyz_base
             per_cam_exists[cam_name] = exists
+            per_cam_visibility[cam_name] = vis_out
+            per_cam_depth_valid[cam_name] = depth_valid_out
             per_cam_conf[cam_name] = conf_out
             per_cam_cols[cam_name] = np.repeat(cols0[None, :, :], T, axis=0)
 
@@ -542,7 +615,7 @@ class OnlineSceneFlowBuilder:
                     uv_tracks=uv_tracks,
                     visibility=visibility,
                     confidence=confidence,
-                    stable_mask0=stable,
+                    stable_mask0=stable_mask0,
                     new_query_index=shift,
                     rgb0=rgb_shift,
                     depth0=depth_shift,
@@ -568,11 +641,15 @@ class OnlineSceneFlowBuilder:
         xyz_list = [per_cam_xyz[n] for n in cameras_used]
         cols_list = [per_cam_cols[n] for n in cameras_used]
         exists_list = [per_cam_exists[n] for n in cameras_used]
+        vis_list = [per_cam_visibility[n] for n in cameras_used]
+        depth_valid_list = [per_cam_depth_valid[n] for n in cameras_used]
         conf_list = [per_cam_conf[n] for n in cameras_used]
 
         scene_flows = np.concatenate(xyz_list, axis=1).astype(np.float32)
         scene_colors = np.concatenate(cols_list, axis=1).astype(np.uint8)
         scene_exists = np.concatenate(exists_list, axis=1).astype(bool)
+        scene_visibility = np.concatenate(vis_list, axis=1).astype(bool)
+        scene_depth_valid_mask = np.concatenate(depth_valid_list, axis=1).astype(bool)
         scene_track_confidence = np.concatenate(conf_list, axis=1).astype(np.float32)
 
         camera_track_slices = []
@@ -589,6 +666,8 @@ class OnlineSceneFlowBuilder:
             scene_flows=scene_flows,
             scene_colors=scene_colors,
             scene_exists=scene_exists,
+            scene_visibility=scene_visibility,
+            scene_depth_valid_mask=scene_depth_valid_mask,
             scene_track_confidence=scene_track_confidence,
             camera_track_slices=tuple(camera_track_slices),
             camera_track_ids=camera_track_ids,
